@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { DEFAULT_INBOX_AVATAR, DEFAULT_INBOX_TITLE, INBOX_SESSION_ID } from '@lobechat/const';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { getTestDB } from '../../core/getTestDB';
@@ -71,6 +72,50 @@ describe('AgentModel.getAgentAvatarsByIds', () => {
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe('agent-mine');
+  });
+
+  it('should fallback to LobeAI defaults for inbox agent without avatar/title', async () => {
+    await serverDB.insert(agents).values({
+      avatar: null,
+      backgroundColor: null,
+      id: 'agent-inbox',
+      slug: INBOX_SESSION_ID,
+      title: null,
+      userId,
+    });
+
+    const model = new AgentModel(serverDB, userId);
+    const result = await model.getAgentAvatarsByIds(['agent-inbox']);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      avatar: DEFAULT_INBOX_AVATAR,
+      backgroundColor: null,
+      id: 'agent-inbox',
+      title: DEFAULT_INBOX_TITLE,
+    });
+  });
+
+  it('should not override inbox agent avatar/title when they are set', async () => {
+    await serverDB.insert(agents).values({
+      avatar: '🤖',
+      backgroundColor: '#123456',
+      id: 'agent-inbox-custom',
+      slug: 'inbox',
+      title: 'Custom Inbox',
+      userId,
+    });
+
+    const model = new AgentModel(serverDB, userId);
+    const result = await model.getAgentAvatarsByIds(['agent-inbox-custom']);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({
+      avatar: '🤖',
+      backgroundColor: '#123456',
+      id: 'agent-inbox-custom',
+      title: 'Custom Inbox',
+    });
   });
 
   it('should return only selected fields', async () => {
