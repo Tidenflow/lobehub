@@ -1,4 +1,3 @@
-import type { HeterogeneousAgentSessionError } from '@lobechat/electron-client-ipc';
 import { HeterogeneousAgentSessionErrorCode } from '@lobechat/electron-client-ipc';
 import { type ILobeAgentRuntimeErrorType } from '@lobechat/model-runtime';
 import { AgentRuntimeErrorType, getErrorCodeSpec } from '@lobechat/model-runtime';
@@ -15,15 +14,23 @@ import useRenderBusinessChatErrorMessageExtra from '@/business/client/hooks/useR
 import ErrorContent from '@/features/Conversation/ChatItem/components/ErrorContent';
 import { dataSelectors, useConversationStore } from '@/features/Conversation/store';
 import HeterogeneousAgentStatusGuide from '@/features/Electron/HeterogeneousAgent/StatusGuide';
+import type { HeterogeneousAgentScheduleState } from '@/features/Electron/HeterogeneousAgent/StatusGuide/types';
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
 import { usePermission } from '@/hooks/usePermission';
 import { useProviderName } from '@/hooks/useProviderName';
 import dynamic from '@/libs/next/dynamic';
+import { useChatStore } from '@/store/chat';
+import { topicSelectors } from '@/store/chat/selectors';
 import { serverConfigSelectors, useServerConfigStore } from '@/store/serverConfig';
 import { getRuntimeErrorMessage } from '@/utils/locale/runtimeErrorMessage';
 
 import ChatInvalidAPIKey from './ChatInvalidApiKey';
+import { isHeterogeneousAgentStatusGuideError } from './heterogeneous';
 import { useHeterogeneousAutoRetry } from './useHeterogeneousAutoRetry';
+
+// Re-export so existing barrel consumers (ContentBlock, message action bar) can
+// keep importing the guard from '@/features/Conversation/Error'.
+export { isHeterogeneousAgentStatusGuideError } from './heterogeneous';
 
 interface ErrorMessageData {
   error?: ChatMessageError | null;
@@ -88,13 +95,6 @@ const QuotaLimitError = dynamic(() => import('./QuotaLimitError'), { loading, ss
 
 const TraceIdError = dynamic(() => import('./TraceIdError'), { loading, ssr: false });
 
-const HETEROGENEOUS_AGENT_STATUS_GUIDE_ERROR_CODES = new Set<string>([
-  HeterogeneousAgentSessionErrorCode.AuthRequired,
-  HeterogeneousAgentSessionErrorCode.CliNotFound,
-  HeterogeneousAgentSessionErrorCode.Overloaded,
-  HeterogeneousAgentSessionErrorCode.RateLimit,
-]);
-
 // `UnknownChatFetchError` is excluded: its localized copy is a generic
 // "unknown error" message, so the trace-id report UI is strictly more useful.
 const LEGACY_LOCALIZED_ERROR_TYPES = new Set<string>(
@@ -154,20 +154,6 @@ const shouldShowTraceIdError = (
   if (spec?.isFallback) return true;
 
   return !hasLocalizedErrorMessage(errorType);
-};
-
-export const isHeterogeneousAgentStatusGuideError = (
-  value: unknown,
-): value is HeterogeneousAgentSessionError => {
-  if (!value || typeof value !== 'object') return false;
-
-  const { agentType, code } = value as Partial<HeterogeneousAgentSessionError>;
-
-  return (
-    (agentType === 'claude-code' || agentType === 'codex') &&
-    typeof code === 'string' &&
-    HETEROGENEOUS_AGENT_STATUS_GUIDE_ERROR_CODES.has(code)
-  );
 };
 
 // Config for the errorMessage display
@@ -312,12 +298,53 @@ const ErrorMessageExtra = memo<ErrorExtraProps>(
       scopeId: resolvedScopeId,
     });
 
+    // Rate-limit waits are hours, not seconds, so instead of auto-retrying we let
+    // the user hand the continuation off to the backend (topic `scheduled`). All
+    // orchestration lives in the conversation store; this only binds the actions.
+    const scheduleHeteroContinuation = useConversationStore((s) => s.scheduleHeteroContinuation);
+    const cancelHeteroContinuation = useConversationStore((s) => s.cancelHeteroContinuation);
+    const activeTopicScheduled = useChatStore(
+      (s) => topicSelectors.currentActiveTopic(s)?.status === 'scheduled',
+    );
+    const scheduledResetsAt = useChatStore((s) => {
+      const scheduledRun = topicSelectors.currentActiveTopic(s)?.metadata?.scheduledRun;
+      return scheduledRun?.kind === 'resume_after_rate_limit'
+        ? scheduledRun.rateLimit?.resetsAt
+        : undefined;
+    });
+
+    const isRateLimitError =
+      canCreate &&
+      isHeterogeneousAgentStatusGuideError(sessionErrorBody) &&
+      sessionErrorBody.code === HeterogeneousAgentSessionErrorCode.RateLimit;
+    const rateLimitInfo = isHeterogeneousAgentStatusGuideError(sessionErrorBody)
+      ? sessionErrorBody.rateLimitInfo
+      : undefined;
+
+    const schedule: HeterogeneousAgentScheduleState | undefined = isRateLimitError
+      ? {
+          isScheduled: activeTopicScheduled,
+          onCancel: () => void cancelHeteroContinuation(),
+          onRunNow: () => void onRegenerate?.(),
+          onSchedule: () =>
+            void scheduleHeteroContinuation({
+              failedAssistantMessageId: data.id,
+              rateLimit: {
+                rateLimitType: rateLimitInfo?.rateLimitType,
+                resetsAt: rateLimitInfo?.resetsAt,
+              },
+            }),
+          resetsAt: scheduledResetsAt ?? rateLimitInfo?.resetsAt,
+        }
+      : undefined;
+
     if (isHeterogeneousAgentStatusGuideError(sessionErrorBody)) {
       return (
         <HeterogeneousAgentStatusGuide
           agentType={sessionErrorBody.agentType}
           autoRetry={autoRetry}
           error={sessionErrorBody}
+          schedule={schedule}
           onOpenSystemTools={() => navigate('/settings/system-tools')}
           onRetry={handleManualRetry}
         />

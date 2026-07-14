@@ -1,8 +1,7 @@
 import type * as LobeChatConst from '@lobechat/const';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type * as Antd from 'antd';
 import type * as LucideReact from 'lucide-react';
-import type { PropsWithChildren, ReactNode } from 'react';
+import type { CSSProperties, PropsWithChildren, ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import Header from './index';
@@ -87,7 +86,10 @@ vi.mock('@lobehub/ui/base-ui', () => ({
 }));
 
 vi.mock('antd', async (importOriginal) => {
-  const actual = await importOriginal<typeof Antd>();
+  const actual = (await importOriginal()) as {
+    App: Record<string, unknown>;
+    Modal: Record<string, unknown>;
+  } & Record<string, unknown>;
 
   return {
     ...actual,
@@ -143,9 +145,19 @@ vi.mock('@/features/AgentBreadcrumb', () => ({
 }));
 
 vi.mock('@/features/NavHeader', () => ({
-  default: ({ left, right }: { left?: ReactNode; right?: ReactNode }) => (
+  default: ({
+    left,
+    right,
+    styles,
+  }: {
+    left?: ReactNode;
+    right?: ReactNode;
+    styles?: { left?: CSSProperties };
+  }) => (
     <header>
-      {left}
+      <div data-testid="nav-header-left" style={styles?.left}>
+        {left}
+      </div>
       {right}
     </header>
   ),
@@ -204,10 +216,6 @@ vi.mock('./AgentStatusTag', () => ({
   default: () => null,
 }));
 
-vi.mock('./AutoSaveHint', () => ({
-  default: () => null,
-}));
-
 vi.mock('./AgentVersionReviewTag', () => ({
   default: () => null,
 }));
@@ -219,8 +227,20 @@ describe('Agent profile Header', () => {
     vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
     mocks.agentState.isCurrentAgentHeterogeneous = false;
     mocks.agentState.systemRole = 'You are helpful.';
+    mocks.globalState.showAgentBuilderPanel = false;
     mocks.profileState.editor = undefined;
   });
+
+  it.each([false, true])(
+    'keeps the breadcrumb aligned with the left content inset when builder expanded is %s',
+    (showAgentBuilderPanel) => {
+      mocks.globalState.showAgentBuilderPanel = showAgentBuilderPanel;
+
+      render(<Header />);
+
+      expect(screen.getByTestId('nav-header-left').style.paddingInlineStart).toBe('8px');
+    },
+  );
 
   it('should show the markdown export action', () => {
     render(<Header />);

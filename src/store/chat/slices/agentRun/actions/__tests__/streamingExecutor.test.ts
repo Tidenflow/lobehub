@@ -190,6 +190,10 @@ describe('StreamingExecutor actions', () => {
 
       // Verify agent runtime executed successfully
       expect(streamSpy).toHaveBeenCalled();
+      expect(result.current.refreshMessages).toHaveBeenCalledWith({
+        agentId: TEST_IDS.SESSION_ID,
+        topicId: TEST_IDS.TOPIC_ID,
+      });
 
       // Verify operation was completed
       const operations = Object.values(result.current.operations);
@@ -2184,6 +2188,9 @@ describe('StreamingExecutor actions', () => {
         });
         operationId = res.operationId;
       });
+      const updateTopicStatusSpy = vi
+        .spyOn(result.current, 'updateTopicStatus')
+        .mockResolvedValue(undefined as any);
 
       // Mock internal_createAgentState to return waiting_for_human status
       mockInternalCreateAgentState({
@@ -2201,7 +2208,13 @@ describe('StreamingExecutor actions', () => {
         agentConfig: createMockResolvedAgentConfig(),
       });
       vi.spyOn(agentRuntime.AgentRuntime.prototype, 'step').mockResolvedValue({
-        events: [],
+        events: [
+          {
+            operationId,
+            pendingToolsCalling: [],
+            type: 'human_approve_required',
+          },
+        ],
         newState: createMockRuntimeState(operationId!, 'waiting_for_human'),
         nextContext: undefined,
       });
@@ -2224,6 +2237,13 @@ describe('StreamingExecutor actions', () => {
       // 1. User can see the tool intervention UI without loading indicator
       // 2. A new operation will be created when user approves/rejects
       expect(result.current.operations[operationId!].status).toBe('completed');
+      expect(updateTopicStatusSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: TEST_IDS.SESSION_ID,
+          status: 'waitingForHuman',
+          topicId: TEST_IDS.TOPIC_ID,
+        }),
+      );
       // Parked ≠ terminal: NO `client.runtime.complete` is emitted — the run has
       // not ended, it is waiting for human approval — parked states do not emit
       // mis-emitted a terminal `cancelled` complete signal.

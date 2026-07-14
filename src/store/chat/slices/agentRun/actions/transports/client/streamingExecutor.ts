@@ -710,11 +710,21 @@ export class StreamingExecutorActionImpl {
           }
 
           case 'human_approve_required': {
-            await notifyDesktopHumanApprovalRequired(this.#get, {
-              agentId,
-              groupId,
-              topicId,
-            });
+            await notifyDesktopHumanApprovalRequired(this.#get, context);
+            if (topicId) {
+              const statusWrite = this.#get().updateTopicStatus?.({
+                agentId,
+                groupId,
+                ...(context.scope === 'group' || context.scope === 'group_agent'
+                  ? { scope: context.scope }
+                  : {}),
+                status: 'waitingForHuman',
+                topicId,
+              });
+              void statusWrite?.catch((error) => {
+                console.error('[streamingExecutor] updateTopicStatus failed:', error);
+              });
+            }
             break;
           }
 
@@ -777,6 +787,10 @@ export class StreamingExecutorActionImpl {
       state.status,
       stepCount,
     );
+
+    // Runtime message transports persist through quiet batch mutations. Reconcile
+    // once at the run boundary instead of replacing the full list after every write.
+    await this.#get().refreshMessages(context);
 
     // Run-completion side effects are assembled once and invoked at
     // this boundary. The bodies are relocated verbatim into `buildRunLifecycle`,
@@ -881,12 +895,16 @@ export class StreamingExecutorActionImpl {
       void this.#get().refreshThreads();
 
       // 2. Build the sub-agent ConversationContext (threadId provides isolation)
+      const workspaceSlug = parentOperationId
+        ? this.#get().operations[parentOperationId]?.context.workspaceSlug
+        : undefined;
       const subContext: ConversationContext = {
         agentId,
         isSubAgent: true,
         scope: 'thread',
         threadId,
         topicId,
+        ...(workspaceSlug ? { workspaceSlug } : {}),
       };
 
       // 3. Create a child operation chained to the parent runtime operation
@@ -928,13 +946,16 @@ export class StreamingExecutorActionImpl {
       const resultContent = lastAssistant?.content || 'Task completed';
       const totalToolCalls = subTaskMessages.filter((m) => m.role === 'tool').length;
       const { usage, cost, model } = runtimeResult || {};
+      const totalCost = cost?.total;
+      const totalInputTokens = usage?.llm?.tokens?.input;
+      const totalOutputTokens = usage?.llm?.tokens?.output;
       const totalTokens = usage?.llm?.tokens?.total;
 
       // 8. Persist final Thread status + metadata
       await aiAgentService.updateClientTaskThreadStatus({
         completionReason: 'done',
         metadata: {
-          totalCost: cost?.total,
+          totalCost,
           totalMessages: subTaskMessages.length,
           totalTokens,
           totalToolCalls,
@@ -946,7 +967,22 @@ export class StreamingExecutorActionImpl {
       this.#get().completeOperation(taskOperationId);
 
       log('[%s] Completed, result %d chars', logId, resultContent.length);
-      return { model, result: resultContent, success: true, threadId, totalToolCalls, totalTokens };
+      // Cost + the token split ride back to the caller, not just the total: they
+      // land on the tool message's pluginState, which is the only place the parent's
+      // usage tray can see a sub-agent's spend (its messages are in a thread the
+      // parent never loads). Returning tokens alone makes a client sub-agent read as
+      // free.
+      return {
+        model,
+        result: resultContent,
+        success: true,
+        threadId,
+        totalCost,
+        totalInputTokens,
+        totalOutputTokens,
+        totalToolCalls,
+        totalTokens,
+      };
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       log('[%s] Error: %O', logId, error);

@@ -53,8 +53,11 @@ const ProfileSetting = () => {
   // Fetch Composio servers
   useFetchUserComposioConnections(enableComposio);
 
-  const isLoading =
-    !isUserLoaded || (isLogin && !isLoadedAuthProviders) || (enableComposio && !isServersInit);
+  // Only the core profile rows (avatar / name / username / email) gate on the
+  // user record itself. Auth-providers (SSO) and Composio are independent, slower
+  // sub-sections that render their own rows when ready — folding them into one
+  // composite gate let a single slow/failed dependency skeleton the whole tab.
+  const isLoading = !isUserLoaded;
 
   useEffect(() => {
     if (isLogin) {
@@ -106,19 +109,22 @@ const ProfileSetting = () => {
             </>
           )}
 
-          {isLogin && !isDesktop && (
+          {isLogin && !isDesktop && isLoadedAuthProviders && (
             <>
               <Divider style={{ margin: 0 }} />
-              <ProfileRow label={t('profile.sso.providers')}>
+              <ProfileRow anchor={'profile-connected-accounts'} label={t('profile.sso.providers')}>
                 <SSOProvidersList />
               </ProfileRow>
             </>
           )}
 
-          {enableComposio && connectedServers.length > 0 && (
+          {enableComposio && isServersInit && connectedServers.length > 0 && (
             <>
               <Divider style={{ margin: 0 }} />
-              <ProfileRow label={t('profile.authorizations.title')}>
+              <ProfileRow
+                anchor={'profile-authorizations'}
+                label={t('profile.authorizations.title')}
+              >
                 <ComposioAuthorizationList servers={connectedServers} />
               </ProfileRow>
             </>

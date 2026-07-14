@@ -838,6 +838,17 @@ export interface RunSubAgentResult {
   success: boolean;
   /** The isolation thread holding the sub-agent's full message trace */
   threadId: string;
+  /**
+   * Cost of the sub-agent run. Lands on the tool message's `pluginState`, which is
+   * how the parent's usage tray accounts for a sub-agent at all: the tray sums
+   * per-MESSAGE usage, and the child's own messages live in an isolation thread the
+   * parent never loads. Omit it and the tray reports the child as free.
+   */
+  totalCost?: number;
+  /** Input tokens consumed by the sub-agent run */
+  totalInputTokens?: number;
+  /** Output tokens produced by the sub-agent run */
+  totalOutputTokens?: number;
   /** Total tokens consumed by the sub-agent run */
   totalTokens?: number;
   /** Number of tool calls the sub-agent made */
@@ -934,6 +945,14 @@ export interface ToolHookContext {
    * Useful for correlating before/after hooks against the same call.
    */
   toolCallId?: string;
+  /**
+   * Topic id of the run this tool call belongs to (the bound operation's topic),
+   * threaded from the event handler's conversation context. Prefer this over the
+   * globally-active topic so a hook's side effects land on the run's own topic
+   * even if the user has navigated away mid-run. Undefined when the run has no
+   * topic yet.
+   */
+  topicId?: string;
 }
 
 export interface ToolBeforeCallContext extends ToolHookContext {}

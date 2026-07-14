@@ -1,7 +1,8 @@
 'use client';
 
 import { SendButton } from '@lobehub/editor/react';
-import { Button, Flexbox, Select, Text } from '@lobehub/ui';
+import { Flexbox, Text } from '@lobehub/ui';
+import { Button, Select } from '@lobehub/ui/base-ui';
 import { cssVar } from 'antd-style';
 import { Undo2Icon } from 'lucide-react';
 import { memo, useCallback, useRef, useState } from 'react';
@@ -45,7 +46,7 @@ const ResponseLanguageStep = memo<ResponseLanguageStepProps>(({ onBack, onNext }
       // (`commonStepsCompleted` keys off `responseLanguage`), so it must be able
       // to fail: on error reset the navigating lock so the user can retry
       // instead of being stuck with both buttons permanently disabled
-      // (LOBE-11154).
+      //
       await setSettings({ general: { responseLanguage: value } });
       await onNext();
     } catch {

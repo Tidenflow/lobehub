@@ -1,9 +1,17 @@
 'use client';
 
-import type { VerifyEvidenceType, VerifyRunContext } from '@lobechat/types';
+import type {
+  VerifyCodingScope,
+  VerifyEvidenceType,
+  VerifyInteractionCost,
+  VerifyInteractionCostOperators,
+  VerifyInteractionCostPhase,
+} from '@lobechat/types';
+import { toRecord } from '@lobechat/utils/object';
 import {
   Block,
   Center,
+  Drawer,
   Empty,
   Flexbox,
   Highlighter,
@@ -12,18 +20,26 @@ import {
   Markdown,
   Text,
 } from '@lobehub/ui';
-import { Button, Modal } from '@lobehub/ui/base-ui';
-import { createStaticStyles, cssVar } from 'antd-style';
+import { Button } from '@lobehub/ui/base-ui';
+import { createStaticStyles, cssVar, cx } from 'antd-style';
 import type { TFunction } from 'i18next';
 import {
   AlertTriangle,
+  CalendarClock,
   Check,
   ChevronRight,
   CircleHelp,
   Clock3,
+  ExternalLink,
   FileText,
+  GitBranch,
+  GitCommit,
+  GitPullRequest,
   Image as ImageIcon,
+  Layers,
   RefreshCw,
+  Target,
+  Terminal,
   Video,
   X,
 } from 'lucide-react';
@@ -58,7 +74,7 @@ const styles = createStaticStyles(({ css }) => ({
   `,
   page: css`
     width: 100%;
-    max-width: 840px;
+    max-width: 880px;
     margin-inline: auto;
     padding-block: 32px 64px;
     padding-inline: 32px;
@@ -125,6 +141,352 @@ const styles = createStaticStyles(({ css }) => ({
     color: ${cssVar.colorInfoText};
 
     background: ${cssVar.colorInfoBg};
+  `,
+  interactionCost: css`
+    --klm-blue-1: color-mix(in srgb, ${cssVar.colorInfo} 70%, ${cssVar.colorBgContainer});
+    --klm-blue-2: ${cssVar.colorInfo};
+    --klm-blue-3: color-mix(in srgb, ${cssVar.colorInfo} 84%, ${cssVar.colorText});
+    --klm-blue-4: color-mix(in srgb, ${cssVar.colorInfo} 68%, ${cssVar.colorText});
+    --klm-blue-5: color-mix(in srgb, ${cssVar.colorInfo} 54%, ${cssVar.colorText});
+    --klm-blue-6: color-mix(in srgb, ${cssVar.colorInfo} 42%, ${cssVar.colorText});
+
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    width: 100%;
+  `,
+  interactionCostHeader: css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    align-items: center;
+    justify-content: flex-end;
+  `,
+  interactionCostModel: css`
+    font-family: ${cssVar.fontFamilyCode};
+    font-size: 12px;
+    color: ${cssVar.colorTextTertiary};
+  `,
+  interactionMetrics: css`
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+
+    @media (width <= 520px) {
+      grid-template-columns: 1fr;
+    }
+  `,
+  interactionMetric: css`
+    min-width: 0;
+    padding-block: 9px;
+    padding-inline: 10px;
+    border: 1px solid ${cssVar.colorBorderSecondary};
+    border-radius: ${cssVar.borderRadiusSM};
+  `,
+  interactionMetricLabel: css`
+    display: block;
+    margin-block-end: 4px;
+    font-size: 12px;
+    color: ${cssVar.colorTextTertiary};
+  `,
+  interactionMetricValue: css`
+    font-size: 18px;
+    font-weight: 650;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.2;
+    color: ${cssVar.colorText};
+  `,
+  operatorList: css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+  `,
+  operatorChip: css`
+    --operator-color: ${cssVar.colorTextSecondary};
+
+    display: inline-flex;
+    gap: 5px;
+    align-items: baseline;
+
+    font-family: ${cssVar.fontFamilyCode};
+    font-size: 12px;
+    color: color-mix(in srgb, var(--operator-color) 72%, ${cssVar.colorTextSecondary});
+
+    &::before {
+      content: '';
+
+      flex: 0 0 auto;
+
+      width: 6px;
+      height: 6px;
+      margin-block-start: 0.5em;
+      border-radius: 50%;
+
+      background: var(--operator-color);
+    }
+
+    b {
+      font-weight: 650;
+      color: var(--operator-color);
+    }
+
+    &[data-operator='K'] {
+      --operator-color: var(--klm-blue-1);
+    }
+
+    &[data-operator='P'] {
+      --operator-color: var(--klm-blue-2);
+    }
+
+    &[data-operator='M'] {
+      --operator-color: var(--klm-blue-3);
+    }
+
+    &[data-operator='H'] {
+      --operator-color: var(--klm-blue-4);
+    }
+
+    &[data-operator='T_chars'] {
+      --operator-color: var(--klm-blue-5);
+    }
+
+    &[data-operator='R_ms'] {
+      --operator-color: var(--klm-blue-6);
+    }
+  `,
+  phaseList: css`
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  `,
+  phaseRow: css`
+    display: grid;
+    grid-template-columns: minmax(120px, 1fr) minmax(140px, 1.6fr) auto;
+    gap: 10px;
+    align-items: center;
+
+    @media (width <= 640px) {
+      grid-template-columns: 1fr;
+      gap: 5px;
+    }
+  `,
+  phaseName: css`
+    overflow: hidden;
+
+    font-size: 12px;
+    color: ${cssVar.colorTextSecondary};
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  `,
+  phaseTrack: css`
+    overflow: hidden;
+    display: flex;
+
+    height: 8px;
+    border-radius: 999px;
+
+    background: transparent;
+    box-shadow: inset 0 0 0 1px ${cssVar.colorBorderSecondary};
+  `,
+  phaseSegment: css`
+    --operator-color: ${cssVar.colorTextSecondary};
+
+    flex: 0 0 auto;
+    min-width: 2px;
+    height: 100%;
+    background: var(--operator-color);
+
+    &[data-operator='K'] {
+      --operator-color: var(--klm-blue-1);
+    }
+
+    &[data-operator='P'] {
+      --operator-color: var(--klm-blue-2);
+    }
+
+    &[data-operator='M'] {
+      --operator-color: var(--klm-blue-3);
+    }
+
+    &[data-operator='H'] {
+      --operator-color: var(--klm-blue-4);
+    }
+
+    &[data-operator='T_chars'] {
+      --operator-color: var(--klm-blue-5);
+    }
+
+    &[data-operator='R_ms'] {
+      --operator-color: var(--klm-blue-6);
+    }
+  `,
+  phaseValue: css`
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: ${cssVar.colorTextTertiary};
+  `,
+  codingScope: css`
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+
+    max-width: 100%;
+    margin-block-start: 8px;
+  `,
+  codingScopeMain: css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    align-items: center;
+
+    min-width: 0;
+  `,
+  branchChip: css`
+    display: inline-flex;
+    flex: 0 1 auto;
+    gap: 6px;
+    align-items: center;
+
+    min-width: 0;
+    max-width: 360px;
+
+    color: ${cssVar.colorTextTertiary};
+
+    code {
+      overflow: hidden;
+
+      min-width: 0;
+
+      font-family: ${cssVar.fontFamilyCode};
+      font-size: 12px;
+      color: ${cssVar.colorTextSecondary};
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    svg {
+      flex: 0 0 auto;
+      color: ${cssVar.colorTextQuaternary};
+    }
+  `,
+  commitChip: css`
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 6px;
+    align-items: center;
+
+    color: ${cssVar.colorTextTertiary};
+
+    code {
+      font-family: ${cssVar.fontFamilyCode};
+      font-size: 12px;
+      color: ${cssVar.colorTextTertiary};
+    }
+
+    svg {
+      flex: 0 0 auto;
+      color: ${cssVar.colorTextQuaternary};
+    }
+  `,
+  prChip: css`
+    cursor: default;
+
+    display: inline-flex;
+    flex: 0 1 auto;
+    gap: 6px;
+    align-items: center;
+
+    min-width: 0;
+    max-width: 420px;
+
+    font-size: 12px;
+    color: ${cssVar.colorTextSecondary};
+    text-decoration: none;
+
+    &[data-link='true'] {
+      cursor: pointer;
+    }
+
+    &[data-link='true']:hover {
+      color: ${cssVar.colorLink};
+    }
+
+    > svg:first-child {
+      flex: 0 0 auto;
+      color: ${cssVar.colorTextQuaternary};
+    }
+  `,
+  prNumber: css`
+    flex: 0 0 auto;
+    color: ${cssVar.colorTextSecondary};
+  `,
+  prTitle: css`
+    overflow: hidden;
+    flex: 1 1 auto;
+
+    min-width: 0;
+
+    color: ${cssVar.colorTextTertiary};
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  `,
+  scopeMetaRow: css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 14px;
+    align-items: center;
+
+    min-width: 0;
+  `,
+  scopeMetaItem: css`
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+
+    min-width: 0;
+    max-width: 100%;
+
+    font-size: 12px;
+    line-height: 1.45;
+    color: ${cssVar.colorTextTertiary};
+
+    code {
+      overflow: hidden;
+
+      min-width: 0;
+
+      font-family: ${cssVar.fontFamilyCode};
+      font-size: 12px;
+      color: ${cssVar.colorTextSecondary};
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  `,
+  scopeFocus: css`
+    display: inline-flex;
+    gap: 6px;
+    align-items: flex-start;
+
+    max-width: 72ch;
+
+    font-size: 13px;
+    line-height: 1.45;
+    color: ${cssVar.colorTextSecondary};
+  `,
+  surfaceList: css`
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  `,
+  surfaceChip: css`
+    padding-block: 1px;
+    padding-inline: 6px;
+    border-radius: ${cssVar.borderRadiusSM};
+
+    font-size: 12px;
+    color: ${cssVar.colorTextSecondary};
+
+    background: ${cssVar.colorFillTertiary};
   `,
 
   /* sticky filter chips */
@@ -292,6 +654,10 @@ const styles = createStaticStyles(({ css }) => ({
   /* narrative */
   narrative: css`
     margin-block-start: 24px;
+
+    &:not([open]) > :not(summary) {
+      display: none;
+    }
   `,
   narrativeSummary: css`
     cursor: pointer;
@@ -321,6 +687,9 @@ const styles = createStaticStyles(({ css }) => ({
 
     background: ${cssVar.colorBgContainer};
   `,
+  interactionCostBody: css`
+    margin-block-start: 12px;
+  `,
 
   /* evidence */
   evidenceList: css`
@@ -330,6 +699,63 @@ const styles = createStaticStyles(({ css }) => ({
     align-items: flex-start;
 
     max-width: 70ch;
+  `,
+  comparison: css`
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    width: 100%;
+
+    @media (width <= 640px) {
+      grid-template-columns: 1fr;
+    }
+  `,
+  /* Wide, short captures (a toolbar, a one-line footer) get halved into
+     illegible slivers by the two-column grid — stack them instead. */
+  comparisonVertical: css`
+    grid-template-columns: 1fr;
+  `,
+  comparisonItem: css`
+    overflow: hidden;
+
+    min-width: 0;
+    border: 1px solid ${cssVar.colorBorderSecondary};
+    border-radius: ${cssVar.borderRadius};
+
+    background: ${cssVar.colorBgContainer};
+  `,
+  /* The role rides on a tinted band fused to its own screenshot, so which state
+     you're looking at survives being read at a glance — a neutral heading above
+     the image reads as a caption for the whole pair. */
+  comparisonLabel: css`
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+
+    padding-block: 7px;
+    padding-inline: 10px;
+
+    font-size: 12px;
+  `,
+  comparisonLabelBefore: css`
+    border-block-end: 1px solid ${cssVar.colorErrorBorder};
+    color: ${cssVar.colorErrorText};
+    background: ${cssVar.colorErrorBg};
+  `,
+  comparisonLabelAfter: css`
+    border-block-end: 1px solid ${cssVar.colorSuccessBorder};
+    color: ${cssVar.colorSuccessText};
+    background: ${cssVar.colorSuccessBg};
+  `,
+  comparisonRole: css`
+    flex: none;
+    font-weight: 600;
+  `,
+  /* The two captions are themselves a before/after contrast, so they must stay
+     readable side by side — wrap rather than ellipsize. */
+  comparisonCaption: css`
+    min-width: 0;
+    opacity: 0.85;
   `,
   evidenceFile: css`
     cursor: pointer;
@@ -467,9 +893,13 @@ const VERDICT_META: Record<
 };
 
 const imageEvidenceTypes = new Set(['gif', 'screenshot']);
-/** Media that renders/plays inline in the check body (image + video), no click-to-open. */
-const isInlineEvidence = (evidence: VerifyEvidenceWithUrl) =>
+/** Visual media that renders/plays inline in the check body, no click-to-open. */
+const isInlineVisualEvidence = (evidence: VerifyEvidenceWithUrl) =>
   Boolean(evidence.fileUrl && (imageEvidenceTypes.has(evidence.type) || evidence.type === 'video'));
+
+/** Evidence with a directly renderable payload in the check body, no click-to-open. */
+const isInlineEvidence = (evidence: VerifyEvidenceWithUrl) =>
+  Boolean(evidence.content) || isInlineVisualEvidence(evidence);
 
 /** Coarse attachment bucket for the type marker: image / video / everything else. */
 type EvidenceCategory = 'file' | 'image' | 'video';
@@ -491,6 +921,137 @@ const liveStatusLabelKey = {
   verifying: 'report.status.verifying',
 } as const;
 
+const OPERATOR_KEYS = ['K', 'P', 'M', 'H', 'T_chars', 'R_ms'] as const;
+type OperatorKey = (typeof OPERATOR_KEYS)[number];
+
+const OPERATOR_DEFAULT_SECONDS: Record<OperatorKey, number> = {
+  H: 0.4,
+  K: 0.2,
+  M: 1.35,
+  P: 1.1,
+  R_ms: 0.001,
+  T_chars: 0.2,
+};
+
+const finiteNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+
+const finiteString = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.length > 0 ? value : undefined;
+
+const readOperators = (value: unknown): VerifyInteractionCostOperators => {
+  const record = toRecord(value);
+  if (!record) return {};
+
+  return {
+    H: finiteNumber(record.H),
+    K: finiteNumber(record.K),
+    M: finiteNumber(record.M),
+    P: finiteNumber(record.P),
+    R_ms: finiteNumber(record.R_ms),
+    T_chars: finiteNumber(record.T_chars),
+  };
+};
+
+const readTimingSeconds = (value: unknown): Record<string, number> | undefined => {
+  const record = toRecord(value);
+  if (!record) return undefined;
+
+  const entries = Object.entries(record).flatMap(([key, field]) => {
+    const seconds = finiteNumber(field);
+    return seconds === undefined ? [] : [[key, seconds] as const];
+  });
+
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+};
+
+const readPhase = (value: unknown, index: number): VerifyInteractionCostPhase | null => {
+  const record = toRecord(value);
+  if (!record) return null;
+
+  const seconds = finiteNumber(record.seconds);
+  const activeSeconds = finiteNumber(record.activeSeconds);
+  const waitSeconds = finiteNumber(record.waitSeconds);
+  const hasTiming =
+    seconds !== undefined || activeSeconds !== undefined || waitSeconds !== undefined;
+  if (!hasTiming) return null;
+
+  return {
+    actionCount: finiteNumber(record.actionCount),
+    activeSeconds,
+    checkItemId: finiteString(record.checkItemId),
+    id: finiteString(record.id) ?? `phase-${index + 1}`,
+    label: finiteString(record.label),
+    operators: readOperators(record.operators),
+    seconds,
+    waitSeconds,
+  };
+};
+
+const readInteractionCost = (metadata: unknown): VerifyInteractionCost | null => {
+  const cost = toRecord(toRecord(metadata)?.interactionCost);
+  if (!cost) return null;
+
+  const totalSeconds = finiteNumber(cost.totalSeconds);
+  if (totalSeconds === undefined) return null;
+
+  return {
+    actionCount: finiteNumber(cost.actionCount),
+    activeSeconds: finiteNumber(cost.activeSeconds) ?? 0,
+    model: finiteString(cost.model) ?? 'goms-klm',
+    operators: readOperators(cost.operators),
+    phases: Array.isArray(cost.phases)
+      ? cost.phases
+          .map((phase, index) => readPhase(phase, index))
+          .filter((phase): phase is VerifyInteractionCostPhase => Boolean(phase))
+      : [],
+    scope: finiteString(cost.scope),
+    sourceTrace: finiteString(cost.sourceTrace),
+    timingSeconds: readTimingSeconds(cost.timingSeconds),
+    totalSeconds,
+    waitSeconds: finiteNumber(cost.waitSeconds) ?? 0,
+  };
+};
+
+const formatSeconds = (seconds: number): string =>
+  `${seconds >= 10 ? seconds.toFixed(1) : seconds.toFixed(2)}s`;
+
+const phaseSeconds = (phase: VerifyInteractionCostPhase): number =>
+  phase.seconds ?? (phase.activeSeconds ?? 0) + (phase.waitSeconds ?? 0);
+
+const operatorSeconds = (
+  key: OperatorKey,
+  value: number,
+  timingSeconds?: Record<string, number>,
+): number => {
+  if (key === 'R_ms') return value / 1000;
+  if (key === 'T_chars') {
+    return (
+      value * (timingSeconds?.T_chars ?? timingSeconds?.T_char ?? OPERATOR_DEFAULT_SECONDS[key])
+    );
+  }
+
+  return value * (timingSeconds?.[key] ?? OPERATOR_DEFAULT_SECONDS[key]);
+};
+
+const operatorValue = (key: OperatorKey, value: number): string => {
+  if (key === 'R_ms') return formatSeconds(value / 1000);
+  if (key === 'T_chars') return `${Math.round(value)} chars`;
+  return Number.isInteger(value) ? String(value) : value.toFixed(2);
+};
+
+const phaseOperatorSegments = (
+  phase: VerifyInteractionCostPhase,
+  timingSeconds?: Record<string, number>,
+): { key: OperatorKey; seconds: number; value: number }[] =>
+  OPERATOR_KEYS.flatMap((key) => {
+    const value = phase.operators?.[key];
+    if (value === undefined || value <= 0) return [];
+
+    const seconds = operatorSeconds(key, value, timingSeconds);
+    return seconds > 0 ? [{ key, seconds, value }] : [];
+  });
+
 /** Severity-first sort: failed → uncertain → passed. */
 const SEVERITY_RANK: Record<Verdict, number> = { failed: 0, passed: 2, uncertain: 1 };
 
@@ -509,6 +1070,42 @@ const evidenceDisplayName = (
   (evidence.fileUrl ? filenameFromUrl(evidence.fileUrl) : '') ||
   evidence.description ||
   t('report.evidence.inlineFallback', { index });
+
+interface EvidenceComparison {
+  id: string;
+  label?: string;
+  /**
+   * How the pair is arranged. Side by side reads best for tall, narrow captures
+   * (a sidebar, a form); stacking is the only way a wide, short strip (a toolbar,
+   * a one-line footer) stays legible, since two of them side by side halve an
+   * already-thin band. Authors pick per pair; defaults to side by side.
+   */
+  layout: 'horizontal' | 'vertical';
+  role: 'after' | 'before';
+}
+
+const evidenceComparison = (evidence: VerifyEvidenceWithUrl): EvidenceComparison | null => {
+  const metadata = toRecord(evidence.metadata);
+  if (!metadata) return null;
+
+  const comparison = toRecord(metadata.comparison);
+  if (!comparison) return null;
+
+  const role = comparison.role;
+  if (
+    typeof comparison.id !== 'string' ||
+    (role !== 'before' && role !== 'after') ||
+    !isInlineVisualEvidence(evidence)
+  )
+    return null;
+
+  return {
+    id: comparison.id,
+    label: typeof comparison.label === 'string' ? comparison.label : undefined,
+    layout: comparison.layout === 'vertical' ? 'vertical' : 'horizontal',
+    role,
+  };
+};
 
 /** A file-backed text evidence, decoded + syntax highlighted (avoids mojibake). */
 const DocumentViewer = memo<{ fileName?: string | null; url: string }>(({ fileName, url }) => {
@@ -546,6 +1143,109 @@ const DocumentViewer = memo<{ fileName?: string | null; url: string }>(({ fileNa
   );
 });
 
+const InteractionCostPanel = memo<{ cost: VerifyInteractionCost }>(({ cost }) => {
+  const { t } = useTranslation('verify');
+  const phases = cost.phases ?? [];
+  const maxPhaseSeconds = Math.max(...phases.map(phaseSeconds), 0);
+  const metrics = [
+    {
+      label: t('report.interaction.total'),
+      value: formatSeconds(cost.totalSeconds),
+    },
+    {
+      label: t('report.interaction.active'),
+      value: formatSeconds(cost.activeSeconds),
+    },
+    {
+      label: t('report.interaction.wait'),
+      value: formatSeconds(cost.waitSeconds),
+    },
+  ];
+
+  return (
+    <section className={styles.interactionCost}>
+      <div className={styles.interactionCostHeader}>
+        <span className={styles.interactionCostModel}>{cost.model}</span>
+      </div>
+
+      <div className={styles.interactionMetrics}>
+        {metrics.map((metric) => (
+          <div className={styles.interactionMetric} key={metric.label}>
+            <span className={styles.interactionMetricLabel}>{metric.label}</span>
+            <span className={styles.interactionMetricValue}>{metric.value}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className={styles.operatorList}>
+        {OPERATOR_KEYS.map((key) => {
+          const value = cost.operators[key];
+          if (value === undefined) return null;
+
+          return (
+            <span className={styles.operatorChip} data-operator={key} key={key}>
+              <span>{t(`report.interaction.operator.${key}`)}</span>
+              <b>{operatorValue(key, value)}</b>
+            </span>
+          );
+        })}
+      </div>
+
+      {phases.length > 0 && (
+        <div className={styles.phaseList}>
+          {phases.map((phase) => {
+            const seconds = phaseSeconds(phase);
+            const activeSeconds = phase.activeSeconds ?? 0;
+            const waitSeconds = phase.waitSeconds ?? 0;
+            const activeWidth = maxPhaseSeconds > 0 ? (activeSeconds / maxPhaseSeconds) * 100 : 0;
+            const waitWidth = maxPhaseSeconds > 0 ? (waitSeconds / maxPhaseSeconds) * 100 : 0;
+            const segments = phaseOperatorSegments(phase, cost.timingSeconds);
+
+            return (
+              <div className={styles.phaseRow} key={phase.id}>
+                <span className={styles.phaseName} title={phase.label ?? phase.id}>
+                  {phase.label ?? phase.id}
+                </span>
+                <span className={styles.phaseTrack}>
+                  {segments.length > 0 ? (
+                    segments.map((segment) => (
+                      <span
+                        className={styles.phaseSegment}
+                        data-operator={segment.key}
+                        key={segment.key}
+                        style={{
+                          width: `${
+                            maxPhaseSeconds > 0 ? (segment.seconds / maxPhaseSeconds) * 100 : 0
+                          }%`,
+                        }}
+                        title={`${t(`report.interaction.operator.${segment.key}`)} ${formatSeconds(
+                          segment.seconds,
+                        )}`}
+                      />
+                    ))
+                  ) : (
+                    <>
+                      <span className={styles.phaseSegment} style={{ width: `${activeWidth}%` }} />
+                      <span
+                        className={styles.phaseSegment}
+                        data-operator={'R_ms'}
+                        style={{ width: `${waitWidth}%` }}
+                      />
+                    </>
+                  )}
+                </span>
+                <span className={styles.phaseValue}>{formatSeconds(seconds)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+});
+
+InteractionCostPanel.displayName = 'InteractionCostPanel';
+
 /** One evidence artifact rendered by its type: zoomable image/gif, video, doc, text. */
 const EvidenceItem = memo<{ evidence: VerifyEvidenceWithUrl; index: number }>(
   ({ evidence: e, index }) => {
@@ -554,7 +1254,7 @@ const EvidenceItem = memo<{ evidence: VerifyEvidenceWithUrl; index: number }>(
     const description = e.description && e.description !== label ? e.description : null;
     // Inline media (image/gif/video) speaks for itself — the raw filename header
     // is visual noise, so only keep a meaningful caption (description) for it.
-    const isMedia = isInlineEvidence(e);
+    const isMedia = isInlineVisualEvidence(e);
 
     return (
       <Flexbox gap={6}>
@@ -624,31 +1324,90 @@ const EvidenceFileButton = memo<{
 
 EvidenceFileButton.displayName = 'EvidenceFileButton';
 
-/** Modal gallery of one check's evidence — one section per artifact, by type. */
-const EvidenceModal = memo<{
+/** Right-side evidence gallery — one section per artifact, by type. */
+const EvidenceDrawer = memo<{
   evidence: VerifyEvidenceWithUrl[];
   onClose: () => void;
   open: boolean;
   title: string;
 }>(({ evidence, onClose, open, title }) => (
-  <Modal
-    footer={null}
+  <Drawer
+    destroyOnHidden
+    containerMaxWidth={'100%'}
     open={open}
+    placement={'right'}
     title={title}
-    width={'min(760px, 92vw)'}
-    onCancel={() => onClose()}
+    width={'min(1120px, calc(100vw - 48px))'}
+    styles={{
+      body: {
+        height: '100%',
+        padding: 0,
+      },
+      bodyContent: {
+        height: '100%',
+        minHeight: 0,
+        overflow: 'hidden',
+      },
+    }}
+    onClose={onClose}
   >
-    <Flexbox gap={20} style={{ maxHeight: '68vh', overflow: 'auto', paddingBlock: 4 }}>
+    <Flexbox
+      gap={20}
+      height={'100%'}
+      paddingBlock={12}
+      paddingInline={16}
+      style={{ overflow: 'auto' }}
+    >
       {evidence.map((e, index) => (
         <EvidenceItem evidence={e} index={index + 1} key={e.id} />
       ))}
     </Flexbox>
-  </Modal>
+  </Drawer>
 ));
 
 EvidenceItem.displayName = 'EvidenceItem';
 
-EvidenceModal.displayName = 'EvidenceModal';
+const EvidenceComparisonView = memo<{
+  after: VerifyEvidenceWithUrl;
+  before: VerifyEvidenceWithUrl;
+}>(({ after, before }) => {
+  const { t } = useTranslation('verify');
+
+  // Either half may carry the layout; the `before` one wins so a pair can't
+  // render as two different arrangements.
+  const layout = evidenceComparison(before)?.layout ?? evidenceComparison(after)?.layout;
+
+  return (
+    <div className={cx(styles.comparison, layout === 'vertical' && styles.comparisonVertical)}>
+      {[before, after].map((evidence, index) => {
+        const comparison = evidenceComparison(evidence)!;
+        const isBefore = comparison.role === 'before';
+        return (
+          <div className={styles.comparisonItem} key={evidence.id}>
+            <div
+              className={cx(
+                styles.comparisonLabel,
+                isBefore ? styles.comparisonLabelBefore : styles.comparisonLabelAfter,
+              )}
+            >
+              <span className={styles.comparisonRole}>
+                {t(`report.evidence.comparison.${comparison.role}`)}
+              </span>
+              {comparison.label && (
+                <span className={styles.comparisonCaption}>{comparison.label}</span>
+              )}
+            </div>
+            <EvidenceItem evidence={evidence} index={index + 1} />
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
+EvidenceComparisonView.displayName = 'EvidenceComparisonView';
+
+EvidenceDrawer.displayName = 'EvidenceDrawer';
 
 /** One check — an expandable row; evidence opens one artifact at a time. */
 const CheckRow = memo<{ defaultOpen: boolean; result: VerifyResultWithEvidence }>(
@@ -673,6 +1432,22 @@ const CheckRow = memo<{ defaultOpen: boolean; result: VerifyResultWithEvidence }
       : -1;
     const selectedEvidence =
       selectedEvidenceIndex >= 0 ? result.evidence[selectedEvidenceIndex] : null;
+    const comparisonGroups = new Map<
+      string,
+      Partial<Record<'after' | 'before', VerifyEvidenceWithUrl>>
+    >();
+    for (const evidence of result.evidence) {
+      const comparison = evidenceComparison(evidence);
+      if (!comparison) continue;
+      const group = comparisonGroups.get(comparison.id) ?? {};
+      group[comparison.role] = evidence;
+      comparisonGroups.set(comparison.id, group);
+    }
+    const pairedEvidenceIds = new Set(
+      [...comparisonGroups.values()]
+        .filter((group) => group.before && group.after)
+        .flatMap((group) => [group.before!.id, group.after!.id]),
+    );
 
     return (
       <div className={styles.row}>
@@ -717,8 +1492,13 @@ const CheckRow = memo<{ defaultOpen: boolean; result: VerifyResultWithEvidence }
             {evidenceCount > 0 && (
               <>
                 <div className={styles.evidenceList}>
+                  {[...comparisonGroups.entries()].map(([id, group]) =>
+                    group.before && group.after ? (
+                      <EvidenceComparisonView after={group.after} before={group.before} key={id} />
+                    ) : null,
+                  )}
                   {result.evidence.map((e, index) =>
-                    isInlineEvidence(e) ? (
+                    pairedEvidenceIds.has(e.id) ? null : isInlineEvidence(e) ? (
                       <EvidenceItem evidence={e} index={index + 1} key={e.id} />
                     ) : (
                       <EvidenceFileButton
@@ -731,7 +1511,7 @@ const CheckRow = memo<{ defaultOpen: boolean; result: VerifyResultWithEvidence }
                   )}
                 </div>
                 {selectedEvidence && (
-                  <EvidenceModal
+                  <EvidenceDrawer
                     evidence={[selectedEvidence]}
                     open={Boolean(selectedEvidence)}
                     title={evidenceDisplayName(selectedEvidence, t, selectedEvidenceIndex + 1)}
@@ -761,27 +1541,143 @@ const ReportPageState = memo<{
   </Center>
 ));
 
-/** Build the meta row (branch / commit / surface / verified) from the run scope. */
-const scopeToMeta = (
-  context: VerifyRunContext | null | undefined,
-  scenario: string | null | undefined,
-  t: TFunction<'verify'>,
-): { label: string; value: string }[] => {
-  if (scenario !== 'coding' || !context) return [];
-  const { branch, commit, surfaces, entry, focus, testedAt } = context;
-  const surface = surfaces && surfaces.length > 0 ? surfaces.join(' / ') : undefined;
-  const date = testedAt ? new Date(testedAt).toLocaleString() : undefined;
-  return (
-    [
-      { label: t('report.scope.focus'), value: focus },
-      { label: t('report.scope.branch'), value: branch },
-      { label: t('report.scope.surface'), value: surface },
-      { label: t('report.scope.entry'), value: entry },
-      { label: t('report.scope.commit'), value: commit },
-      { label: t('report.scope.date'), value: date },
-    ] as { label: string; value?: string | null }[]
-  ).filter((m): m is { label: string; value: string } => Boolean(m.value));
+const formatScopeDate = (value: string | undefined): string | undefined => {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 };
+
+const safeWebUrl = (value: string | null | undefined): string | undefined => {
+  if (!value) return undefined;
+
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const pullRequestLabel = (
+  pullRequest: NonNullable<VerifyCodingScope['pullRequest']>,
+  t: TFunction<'verify'>,
+) => {
+  if (pullRequest.number === undefined || pullRequest.number === null)
+    return t('report.scope.pullRequest');
+
+  return t('report.scope.pullRequestNumber', {
+    number: String(pullRequest.number).replace(/^#/, ''),
+  });
+};
+
+const CodingScopeCard = memo<{ context: VerifyCodingScope | null | undefined }>(({ context }) => {
+  const { t } = useTranslation('verify');
+  if (!context) return null;
+
+  const { branch, commit, entry, focus, pullRequest, surfaces, testedAt } = context;
+  const hasPullRequest = Boolean(
+    pullRequest && (pullRequest.number !== undefined || pullRequest.title || pullRequest.url),
+  );
+  const date = formatScopeDate(testedAt);
+  const hasScope =
+    Boolean(branch) ||
+    Boolean(commit) ||
+    Boolean(entry) ||
+    Boolean(focus) ||
+    hasPullRequest ||
+    Boolean(surfaces?.length) ||
+    Boolean(date);
+
+  if (!hasScope) return null;
+
+  const pullRequestUrl = safeWebUrl(pullRequest?.url);
+  const pullRequestContent =
+    hasPullRequest && pullRequest ? (
+      <>
+        <Icon icon={GitPullRequest} size={15} />
+        <span className={styles.prNumber}>{pullRequestLabel(pullRequest, t)}</span>
+        {pullRequest.title && <span className={styles.prTitle}>{pullRequest.title}</span>}
+        {pullRequestUrl && <Icon icon={ExternalLink} size={13} />}
+      </>
+    ) : null;
+  const shortCommit = commit && commit.length > 12 ? commit.slice(0, 10) : commit;
+
+  return (
+    <div className={styles.codingScope}>
+      {(hasPullRequest || branch || commit || date) && (
+        <div className={styles.codingScopeMain}>
+          {pullRequestContent &&
+            (pullRequestUrl ? (
+              <a
+                className={styles.prChip}
+                data-link={true}
+                href={pullRequestUrl}
+                rel="noreferrer"
+                target="_blank"
+                title={pullRequest?.title ?? pullRequestUrl}
+              >
+                {pullRequestContent}
+              </a>
+            ) : (
+              <span className={styles.prChip} title={pullRequest?.title}>
+                {pullRequestContent}
+              </span>
+            ))}
+          {branch && (
+            <span className={styles.branchChip} title={branch}>
+              <Icon icon={GitBranch} size={15} />
+              <code>{branch}</code>
+            </span>
+          )}
+          {commit && (
+            <span className={styles.commitChip} title={commit}>
+              <Icon icon={GitCommit} size={14} />
+              <code>{shortCommit}</code>
+            </span>
+          )}
+          {date && (
+            <span className={styles.scopeMetaItem}>
+              <Icon icon={CalendarClock} size={13} />
+              <span>{date}</span>
+            </span>
+          )}
+        </div>
+      )}
+
+      {(surfaces?.length || entry) && (
+        <div className={styles.scopeMetaRow}>
+          {surfaces && surfaces.length > 0 && (
+            <span className={styles.scopeMetaItem}>
+              <Icon icon={Layers} size={13} />
+              <span className={styles.surfaceList}>
+                {surfaces.map((surface) => (
+                  <span className={styles.surfaceChip} key={surface}>
+                    {surface}
+                  </span>
+                ))}
+              </span>
+            </span>
+          )}
+          {entry && (
+            <span className={styles.scopeMetaItem} title={entry}>
+              <Icon icon={Terminal} size={13} />
+              <code>{entry}</code>
+            </span>
+          )}
+        </div>
+      )}
+
+      {focus && (
+        <div className={styles.scopeFocus}>
+          <Icon icon={Target} size={13} />
+          <span>{focus}</span>
+        </div>
+      )}
+    </div>
+  );
+});
+
+CodingScopeCard.displayName = 'CodingScopeCard';
 
 /**
  * The report detail pane. Renders the verdict hero, a sticky verdict-filter bar,
@@ -789,10 +1685,14 @@ const scopeToMeta = (
  * and the full narrative behind a collapsed disclosure. Addressed by `:runId`;
  * refreshes itself while the run is non-terminal.
  */
-const ReportViewer = memo(() => {
+interface ReportViewerProps {
+  runId?: string;
+}
+
+const ReportViewer = memo<ReportViewerProps>(({ runId: explicitRunId }) => {
   const { t } = useTranslation('verify');
-  const { runId } = useParams<{ runId: string }>();
-  const verifyRunId = runId ?? null;
+  const { runId: routeRunId } = useParams<{ runId: string }>();
+  const verifyRunId = explicitRunId ?? routeRunId ?? null;
   const { data, error, isLoading, mutate } = useVerifyReportBundle(verifyRunId);
   const [filter, setFilter] = useState<Filter>('all');
 
@@ -863,7 +1763,8 @@ const ReportViewer = memo(() => {
   const uncertain = report?.uncertainChecks ?? counts.uncertain;
   const verdict = (report?.verdict as Verdict | null) ?? null;
   const visible = filter === 'all' ? ordered : ordered.filter((r) => checkVerdict(r) === filter);
-  const meta = scopeToMeta(run.context, run.scenario, t);
+  const isCodingReport = run.scenario === 'coding';
+  const interactionCost = readInteractionCost(run.metadata);
 
   const chips: { count: number; dot?: string; key: Filter; label: string }[] = [
     { count: total, key: 'all', label: t('report.filter.all') },
@@ -880,92 +1781,101 @@ const ReportViewer = memo(() => {
   return (
     <div className={styles.scroll}>
       <div className={styles.page}>
-        <Flexbox gap={12}>
-          <div className={styles.heroLine}>
-            {verdict && (
-              <span
-                className={styles.pill}
-                style={{ background: VERDICT_META[verdict].bg, color: VERDICT_META[verdict].color }}
+        <main>
+          <Flexbox gap={12}>
+            <div className={styles.heroLine}>
+              <Text as={'h1'} style={{ fontSize: 24, lineHeight: 1.3, margin: 0 }}>
+                {run.title || t('report.titleFallback')}
+              </Text>
+              {verdict && (
+                <span
+                  className={styles.pill}
+                  style={{
+                    background: VERDICT_META[verdict].bg,
+                    color: VERDICT_META[verdict].color,
+                  }}
+                >
+                  <Icon icon={VERDICT_META[verdict].icon} size={15} />
+                  {t(`report.verdict.${verdict}`)}
+                </span>
+              )}
+            </div>
+
+            {!isCodingReport && run.goal && <Text className={styles.summary}>{run.goal}</Text>}
+            {report?.summary && <Text className={styles.summary}>{report.summary}</Text>}
+
+            {isCodingReport && <CodingScopeCard context={run.context} />}
+
+            {liveStatus && (
+              <div className={styles.liveBanner}>
+                <Icon icon={Clock3} size={14} />
+                {t(liveStatusLabelKey[liveStatus])}
+              </div>
+            )}
+          </Flexbox>
+
+          <div className={styles.stats}>
+            {chips.map((c) => (
+              <button
+                className={styles.chip}
+                data-active={filter === c.key}
+                key={c.key}
+                type={'button'}
+                onClick={() => setFilter(c.key)}
               >
-                <Icon icon={VERDICT_META[verdict].icon} size={15} />
-                {t(`report.verdict.${verdict}`)}
+                {c.dot && <span className={styles.dot} style={{ background: c.dot }} />}
+                {c.label} <b>{c.count}</b>
+              </button>
+            ))}
+            {typeof report?.overallConfidence === 'number' && (
+              <span className={`${styles.chip} ${styles.score}`}>
+                {t('report.stats.confidence')} <b>{Math.round(report.overallConfidence * 100)}%</b>
               </span>
             )}
-            <Text as={'h1'} style={{ fontSize: 24, lineHeight: 1.3, margin: 0 }}>
-              {run.title || t('report.titleFallback')}
-            </Text>
           </div>
 
-          {run.scenario !== 'coding' && run.goal && (
-            <Text className={styles.summary}>{run.goal}</Text>
-          )}
-          {report?.summary && <Text className={styles.summary}>{report.summary}</Text>}
-
-          {meta.length > 0 && (
-            <div className={styles.meta}>
-              {meta.map((m) => (
-                <span className={styles.metaItem} key={m.label}>
-                  {m.label} <code>{m.value}</code>
-                </span>
+          {visible.length > 0 ? (
+            <div className={styles.checks}>
+              {visible.map((r) => (
+                <CheckRow
+                  key={r.id}
+                  result={r}
+                  defaultOpen={
+                    checkVerdict(r) === 'failed' || r.evidence.some(isInlineVisualEvidence)
+                  }
+                />
               ))}
             </div>
+          ) : (
+            <Block align={'center'} padding={24}>
+              <Text type={'secondary'}>{t('report.filterEmpty')}</Text>
+            </Block>
           )}
 
-          {liveStatus && (
-            <div className={styles.liveBanner}>
-              <Icon icon={Clock3} size={14} />
-              {t(liveStatusLabelKey[liveStatus])}
-            </div>
+          {report?.content && (
+            <details className={styles.narrative}>
+              <summary className={styles.narrativeSummary}>
+                <Icon icon={ChevronRight} size={13} />
+                {t('report.sections.details')}
+              </summary>
+              <div className={styles.narrativeBody}>
+                <Markdown>{report.content}</Markdown>
+              </div>
+            </details>
           )}
-        </Flexbox>
 
-        <div className={styles.stats}>
-          {chips.map((c) => (
-            <button
-              className={styles.chip}
-              data-active={filter === c.key}
-              key={c.key}
-              type={'button'}
-              onClick={() => setFilter(c.key)}
-            >
-              {c.dot && <span className={styles.dot} style={{ background: c.dot }} />}
-              {c.label} <b>{c.count}</b>
-            </button>
-          ))}
-          {typeof report?.overallConfidence === 'number' && (
-            <span className={`${styles.chip} ${styles.score}`}>
-              {t('report.stats.confidence')} <b>{Math.round(report.overallConfidence * 100)}%</b>
-            </span>
+          {interactionCost && (
+            <details className={styles.narrative}>
+              <summary className={styles.narrativeSummary}>
+                <Icon icon={ChevronRight} size={13} />
+                {t('report.interaction.title')}
+              </summary>
+              <div className={styles.interactionCostBody}>
+                <InteractionCostPanel cost={interactionCost} />
+              </div>
+            </details>
           )}
-        </div>
-
-        {visible.length > 0 ? (
-          <div className={styles.checks}>
-            {visible.map((r) => (
-              <CheckRow
-                defaultOpen={checkVerdict(r) === 'failed' || r.evidence.some(isInlineEvidence)}
-                key={r.id}
-                result={r}
-              />
-            ))}
-          </div>
-        ) : (
-          <Block align={'center'} padding={24}>
-            <Text type={'secondary'}>{t('report.filterEmpty')}</Text>
-          </Block>
-        )}
-
-        {report?.content && (
-          <details className={styles.narrative}>
-            <summary className={styles.narrativeSummary}>
-              <Icon icon={ChevronRight} size={13} />
-              {t('report.sections.details')}
-            </summary>
-            <div className={styles.narrativeBody}>
-              <Markdown>{report.content}</Markdown>
-            </div>
-          </details>
-        )}
+        </main>
       </div>
     </div>
   );

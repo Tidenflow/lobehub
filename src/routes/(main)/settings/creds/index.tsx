@@ -1,6 +1,7 @@
 'use client';
 
-import { Button, Icon, Tooltip } from '@lobehub/ui';
+import { Icon, Tooltip } from '@lobehub/ui';
+import { Button } from '@lobehub/ui/base-ui';
 import { Plus } from 'lucide-react';
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -10,15 +11,18 @@ import SettingHeader from '@/routes/(main)/settings/features/SettingHeader';
 
 import { createCreateCredModal } from './features/CreateCredModal';
 import CredsList from './features/CredsList';
+import { useCredsApi } from './features/useCredsApi';
 
 const Page = () => {
   const { t } = useTranslation('setting');
   const { allowed: canManageCredentials, reason } = usePermission('manage_provider_key');
   const [refreshKey, setRefreshKey] = useState(0);
+  const credsApi = useCredsApi();
 
   const handleCreate = () => {
     if (!canManageCredentials) return;
     createCreateCredModal({
+      credsApi,
       onSuccess: () => setRefreshKey((k) => k + 1),
     });
   };

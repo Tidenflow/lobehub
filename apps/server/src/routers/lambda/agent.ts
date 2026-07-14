@@ -1,3 +1,4 @@
+import { BUILTIN_AGENT_SLUGS } from '@lobechat/builtin-agents';
 import { DEFAULT_AGENT_CONFIG, INBOX_SESSION_ID } from '@lobechat/const';
 import { CreateAgentSchema, type KnowledgeItem } from '@lobechat/types';
 import { KnowledgeType } from '@lobechat/types';
@@ -11,6 +12,7 @@ import { ChatGroupModel } from '@/database/models/chatGroup';
 import { FileModel } from '@/database/models/file';
 import { KnowledgeBaseModel } from '@/database/models/knowledgeBase';
 import { SessionModel } from '@/database/models/session';
+import { TaskModel } from '@/database/models/task';
 import { UserModel } from '@/database/models/user';
 import { router } from '@/libs/trpc/lambda';
 import { serverDatabase } from '@/libs/trpc/lambda/middleware';
@@ -19,6 +21,11 @@ import { EditLockService } from '@/server/services/editLock';
 import { publishResourceEvent } from '@/server/services/resourceEvents';
 import { hasWorkspaceScopedPermission } from '@/server/services/workspacePermission';
 import { TransferErrorCode } from '@/types/transferError';
+
+import {
+  assertWorkspaceRowManageable,
+  isWorkspaceNonOwner,
+} from './_helpers/assertWorkspaceRowManageable';
 
 const agentProcedure = wsCompatProcedure.use(serverDatabase).use(async (opts) => {
   const { ctx } = opts;
@@ -86,6 +93,11 @@ export const agentRouter = router({
     .mutation(async ({ input, ctx }) => {
       const agent = await ctx.agentModel.create({
         ...input.config,
+        // The DB-layer AgentItem (packages/database/src/schemas/agent.ts) is
+        // intentionally still typed `plugins?: string[]` — the JSONB column
+        // itself isn't widened, only the domain-level `@lobechat/types`
+        // shapes. Bridges the tri-state object shape through.
+        plugins: input.config?.plugins as unknown as string[] | undefined,
         sessionGroupId: input.groupId,
         // Router-level `visibility` wins over any nested config value so the
         // sidebar's "Create in Private" entry can't be overridden by a stale
@@ -97,16 +109,111 @@ export const agentRouter = router({
     }),
 
   /**
-   * Publish a private agent into the workspace. **One-way** — once an agent
-   * is shared, workspace members may already depend on it, so it can't slip
-   * back to `private`. Only the creator of a still-private agent can run
-   * this; the underlying SQL enforces both rules.
+   * Publish a private agent into the workspace. Only the creator of a
+   * still-private agent can run this; the underlying SQL enforces both rules.
+   * The inverse transition (public → private) goes through
+   * `setAgentVisibility`, which is gated to the creator only (LOBE-11760).
    */
   publishAgentToWorkspace: agentProcedure
     .use(withScopedPermission('agent:update'))
     .input(z.object({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
       return ctx.agentModel.publishToWorkspace(input.id);
+    }),
+
+  /**
+   * Bidirectional visibility switch (LOBE-11551). Rules:
+   * - builtin agents (LobeAI etc., identified by slug) can never change
+   *   visibility — the workspace copy must stay shared;
+   * - only the agent's creator may pull a published agent back to private
+   *   (LOBE-11760): a workspace owner demoting another member's agent would
+   *   effectively appropriate it, so everyone else gets FORBIDDEN. The UI
+   *   hides the entry for them, this is the server-side backstop.
+   */
+  setAgentVisibility: agentProcedure
+    .use(withScopedPermission('agent:update'))
+    .input(z.object({ id: z.string(), visibility: z.enum(['private', 'public']) }))
+    .mutation(async ({ input, ctx }) => {
+      const meta = await ctx.agentModel.getAgentVisibilityMeta(input.id);
+      if (!meta) throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+
+      if (meta.slug && Object.values(BUILTIN_AGENT_SLUGS).includes(meta.slug as any)) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: 'Builtin agents cannot change visibility',
+        });
+      }
+
+      if (meta.visibility === input.visibility) return { success: true };
+
+      if (ctx.workspaceId && meta.userId !== ctx.userId) {
+        // Demoting to private stays creator-only even for owners: the agent
+        // would land in the creator's private list, not the actor's, so an
+        // owner-initiated demotion just appropriates another member's data.
+        if (input.visibility === 'private') {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: 'Only the agent creator can make this agent private',
+          });
+        }
+        const canOverride = await hasWorkspaceScopedPermission({
+          action: 'AGENT_UPDATE',
+          db: ctx.serverDB,
+          scopes: ['ALL'],
+          userId: ctx.userId,
+          workspaceId: ctx.workspaceId,
+        });
+        if (!canOverride) {
+          throw new TRPCError({
+            code: 'FORBIDDEN',
+            message: 'Only the agent creator or workspace owner can change visibility',
+          });
+        }
+      }
+
+      // Demoting an agent must not strand tasks that depend on it: public
+      // tasks would violate the `assertAgentVisibilityCompat` invariant
+      // (members keep seeing the task but can no longer see or run the
+      // assignee), and other members' tasks — private ones included — would
+      // fail future runs/updates because their creators can no longer
+      // resolve the agent. Reject early — reassign or demote those tasks
+      // first.
+      if (input.visibility === 'private' && ctx.workspaceId) {
+        const taskModel = new TaskModel(ctx.serverDB, ctx.userId, ctx.workspaceId);
+        const blockingTasks = await taskModel.countTasksBlockingAgentDemotion(
+          input.id,
+          meta.userId,
+        );
+        if (blockingTasks > 0) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message:
+              'Cannot make this agent private while workspace tasks still depend on it. Reassign those tasks or make them private first.',
+          });
+        }
+
+        // Same source-level guard for group chats, but only for the supervisor
+        // role: a private supervisor is unresolvable for every other viewer and
+        // bricks the whole group. Regular members are not blocked — roster
+        // reads drop a non-visible member per viewer instead (LOBE-11772).
+        const chatGroupModel = new ChatGroupModel(ctx.serverDB, ctx.userId, ctx.workspaceId);
+        const blockingGroups = await chatGroupModel.countGroupsBlockingAgentDemotion(
+          input.id,
+          meta.userId,
+        );
+        if (blockingGroups > 0) {
+          throw new TRPCError({
+            code: 'BAD_REQUEST',
+            message:
+              'Cannot make this agent private while it supervises workspace group chats. Remove it as supervisor first.',
+          });
+        }
+      }
+
+      const updated = await ctx.agentModel.setVisibility(input.id, input.visibility);
+      if (!updated) throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+
+      return { success: true };
     }),
 
   createAgentFiles: agentProcedure
@@ -367,6 +474,24 @@ export const agentRouter = router({
     .use(withScopedPermission('agent:delete'))
     .input(z.object({ agentId: z.string() }))
     .mutation(async ({ input, ctx }) => {
+      // Deleting cascades sessions/topics/messages, so gate to the creator or
+      // a workspace owner before the destructive write.
+      const meta = await ctx.agentModel.getAgentVisibilityMeta(input.agentId);
+      if (!meta) throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+      assertWorkspaceRowManageable(ctx, meta.userId, 'agent');
+      // Same rule as transfer: the delete cascade erases every linked
+      // session/topic/message, so a non-owner member must not take teammates'
+      // conversations down with their own agent.
+      if (
+        isWorkspaceNonOwner(ctx) &&
+        (await ctx.agentModel.transferHasForeignRows(input.agentId))
+      ) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: "Only workspace owners can delete an agent carrying others' conversations",
+        });
+      }
+
       return ctx.agentModel.delete(input.agentId);
     }),
 
@@ -420,9 +545,11 @@ export const agentRouter = router({
         });
       }
 
-      // 2. In workspace mode, members can only transfer agents they created;
-      //    workspace owners can transfer any agent
-      if (ctx.workspaceId && agent.userId !== ctx.userId) {
+      // 2. In workspace mode, members can only transfer private agents they
+      //    created. Public (workspace-shared) agents carry every member's
+      //    conversations, so moving them out is owner-only — even for the
+      //    creator. Owner-level AGENT_UPDATE (scope ALL) overrides both.
+      if (ctx.workspaceId && (agent.visibility === 'public' || agent.userId !== ctx.userId)) {
         const canOverride = await hasWorkspaceScopedPermission({
           action: 'AGENT_UPDATE',
           db: ctx.serverDB,
@@ -435,7 +562,7 @@ export const agentRouter = router({
           throw new TRPCError({
             cause: { data: { code: TransferErrorCode.OwnerOnly } },
             code: 'FORBIDDEN',
-            message: 'Only workspace owners can transfer agents created by others',
+            message: 'Only workspace owners can transfer shared agents or agents created by others',
           });
         }
       }
@@ -464,6 +591,20 @@ export const agentRouter = router({
           cause: { data: { code: TransferErrorCode.SameWorkspace } },
           code: 'BAD_REQUEST',
           message: 'Cannot transfer agent to the same workspace',
+        });
+      }
+
+      // 5. The transfer rehomes every linked topic/message/thread/task — a
+      //    non-owner member must not move teammates' conversations along with
+      //    their own agent.
+      if (
+        isWorkspaceNonOwner(ctx) &&
+        (await ctx.agentModel.transferHasForeignRows(input.agentId))
+      ) {
+        throw new TRPCError({
+          cause: { data: { code: TransferErrorCode.OwnerOnly } },
+          code: 'FORBIDDEN',
+          message: "Only workspace owners can transfer an agent carrying others' conversations",
         });
       }
 

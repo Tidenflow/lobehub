@@ -1,4 +1,4 @@
-import type { DeviceGitWorktreeListItem, WorkingDirEntry } from '@lobechat/types';
+import { deriveWorktreePath, type DeviceGitWorktreeListItem } from '@lobechat/types';
 import { Icon, Input, Tooltip } from '@lobehub/ui';
 import {
   confirmModal,
@@ -13,6 +13,8 @@ import {
 import { createStaticStyles, cssVar, cx } from 'antd-style';
 import {
   CheckIcon,
+  FolderPlusIcon,
+  GitBranchIcon,
   GitForkIcon,
   LoaderCircleIcon,
   RefreshCwIcon,
@@ -24,7 +26,9 @@ import { useTranslation } from 'react-i18next';
 
 import { gitService } from '@/services/git';
 
-import { useCommitWorkingDirectory } from './useCommitWorkingDirectory';
+import { openCreateWorktreeModal } from './CreateWorktreeModal';
+import { useSwitchWorktree } from './useSwitchWorktree';
+import { getPathName, isDisabled, normalizeDisplayPath } from './worktreeHelpers';
 
 const styles = createStaticStyles(({ css }) => ({
   badge: css`
@@ -50,16 +54,6 @@ const styles = createStaticStyles(({ css }) => ({
     font-size: 13px;
     line-height: 18px;
     color: ${cssVar.colorTextSecondary};
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  `,
-  branchInline: css`
-    overflow: hidden;
-
-    min-width: 28px;
-    max-width: 220px;
-
-    color: ${cssVar.colorText};
     text-overflow: ellipsis;
     white-space: nowrap;
   `,
@@ -91,18 +85,6 @@ const styles = createStaticStyles(({ css }) => ({
 
     /* Cancel DropdownMenuPopup's default 4px padding so our sections align edge-to-edge */
     margin: -4px;
-  `,
-  count: css`
-    flex: none;
-
-    padding-inline: 5px;
-    border-radius: 999px;
-
-    font-size: 11px;
-    line-height: 16px;
-    color: ${cssVar.colorTextTertiary};
-
-    background: ${cssVar.colorFillSecondary};
   `,
   diffStat: css`
     display: inline-flex;
@@ -234,6 +216,32 @@ const styles = createStaticStyles(({ css }) => ({
     flex: 1;
     padding: 6px;
   `,
+  createItemWrapper: css`
+    padding: 6px;
+    border-block-start: 1px solid ${cssVar.colorSplit};
+  `,
+  createItem: css`
+    cursor: pointer;
+
+    display: flex;
+    gap: 8px;
+    align-items: center;
+
+    padding-block: 6px;
+    padding-inline: 8px;
+    border-radius: 8px;
+
+    font-size: 13px;
+    color: ${cssVar.colorText};
+
+    &:hover {
+      background: ${cssVar.colorFillTertiary};
+    }
+  `,
+  createItemIcon: css`
+    flex: none;
+    color: ${cssVar.colorTextSecondary};
+  `,
   name: css`
     overflow: hidden;
     flex: 0 1 auto;
@@ -292,12 +300,11 @@ const styles = createStaticStyles(({ css }) => ({
 
     display: inline-flex;
     flex: none;
-    gap: 5px;
     align-items: center;
+    justify-content: center;
 
-    max-width: 420px;
-    padding-block: 2px;
-    padding-inline: 4px;
+    width: 20px;
+    height: 22px;
     border-radius: 4px;
 
     font-size: 12px;
@@ -314,19 +321,7 @@ const styles = createStaticStyles(({ css }) => ({
     display: inline-flex;
     flex: none;
   `,
-  worktreeName: css`
-    overflow: hidden;
-    max-width: 140px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  `,
 }));
-
-const getPathName = (path: string): string =>
-  path.replaceAll('\\', '/').split('/').findLast(Boolean) || path;
-
-const normalizeDisplayPath = (path: string): string =>
-  path.replaceAll('\\', '/').replace(/\/+$/, '');
 
 const TEMP_PATH_PREFIXES = ['/tmp', '/var/tmp', '/private/tmp'];
 
@@ -377,18 +372,24 @@ const getWorktreeBranch = (
   return fallbackBranch;
 };
 
-const isDisabled = (worktree: DeviceGitWorktreeListItem): boolean =>
-  !!worktree.bare || !!worktree.prunable;
-
-// The main/source worktree can never be removed (`git worktree remove <main>`
-// fails with "is a main working tree"), and when the agent runs on a linked
-// worktree it is listed with `current: false` — so exclude it by path too, not
-// just via the `current` flag, to avoid offering a delete that always errors.
-const canRemoveWorktree = (worktree: DeviceGitWorktreeListItem, sourcePath: string): boolean =>
+// The main worktree can never be removed (`git worktree remove <main>` fails with
+// "is a main working tree"), and when the agent runs on a linked worktree it is
+// listed with `current: false` — so exclude it by path too, not just via the
+// `current` flag, to avoid offering a delete that always errors. `sourcePath` is
+// NOT the main worktree whenever the user picks a linked worktree directly as the
+// working directory, so it is excluded separately (removing the conversation's own
+// source repo would strand it), not used as a stand-in for the main worktree.
+const canRemoveWorktree = (
+  worktree: DeviceGitWorktreeListItem,
+  sourcePath: string,
+  mainWorktreePath?: string,
+): boolean =>
   !worktree.current &&
   !worktree.locked &&
   !isDisabled(worktree) &&
-  normalizeDisplayPath(worktree.path) !== normalizeDisplayPath(sourcePath);
+  normalizeDisplayPath(worktree.path) !== normalizeDisplayPath(sourcePath) &&
+  (!mainWorktreePath ||
+    normalizeDisplayPath(worktree.path) !== normalizeDisplayPath(mainWorktreePath));
 
 interface DirtyStatProps {
   status?: DeviceGitWorktreeListItem['status'];
@@ -441,9 +442,9 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
     // slow (up to a 30s timeout + device round-trip), so removal runs detached
     // from the confirm dialog — this tracks in-flight rows to guard against a
     // duplicate delete if the dropdown is reopened mid-removal.
-    const [removingPaths, setRemovingPaths] = useState<Set<string>>(new Set());
+    const [removingPaths, setRemovingPaths] = useState<Set<string>>(() => new Set());
     const currentRowRef = useRef<HTMLDivElement>(null);
-    const { commit } = useCommitWorkingDirectory(agentId);
+    const switchWorktree = useSwitchWorktree({ agentId, isGithub, sourcePath });
 
     // Clear the query each time the dropdown closes so it reopens unfiltered.
     useEffect(() => {
@@ -495,15 +496,10 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
           return;
         }
 
-        const entry: WorkingDirEntry = {
-          ...(worktree.path === sourcePath ? {} : { git: { activeWorktree: worktree.path } }),
-          path: sourcePath,
-          repoType: isGithub ? 'github' : 'git',
-        };
-        await commit(entry);
+        await switchWorktree(worktree.path);
         setOpen(false);
       },
-      [commit, isGithub, sourcePath],
+      [switchWorktree],
     );
 
     const handleRemoveWorktree = useCallback(
@@ -524,12 +520,21 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
           // reconciles on the next `onWorktreesChange` revalidate.
           onOk: () => {
             setRemovingPaths((prev) => new Set(prev).add(worktree.path));
+            // The dropdown is already closed, so a persistent loading toast is the
+            // only signal that a (potentially slow) removal is in progress. It gets
+            // swapped for the success/failure toast once the background op settles.
+            const pendingToast = toast.loading(
+              t('workingDirectory.removeWorktreePending', {
+                name: getPathName(worktree.path),
+              }),
+            );
             void (async () => {
               const result = await gitService.removeGitWorktree({
                 deviceId,
                 path,
                 worktreePath: worktree.path,
               });
+              pendingToast.close();
               if (result.success) {
                 // The list is hidden behind the closed dropdown, so this toast
                 // is the only signal that the background removal finished.
@@ -551,6 +556,32 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
       [deviceId, onWorktreesChange, path, t, tCommon],
     );
 
+    // Create a worktree on a fresh branch (mirrors the branch switcher's "create
+    // branch" flow), then switch the working directory into it. Returns an error
+    // message for inline display in the modal, or undefined on success.
+    const handleCreateWorktree = useCallback(
+      async (branch: string): Promise<string | undefined> => {
+        const worktreePath = deriveWorktreePath(sourcePath, branch);
+        const result = await gitService.addGitWorktree({ branch, deviceId, path, worktreePath });
+        if (!result.success) return result.error || t('workingDirectory.createWorktreeFailed');
+
+        // Point the conversation at the freshly created worktree, then reconcile
+        // the list so the new row (now `current`) appears.
+        await switchWorktree(result.worktreePath ?? worktreePath);
+        await onWorktreesChange?.();
+        return undefined;
+      },
+      [deviceId, onWorktreesChange, path, sourcePath, switchWorktree, t],
+    );
+
+    const openCreateWorktree = useCallback(() => {
+      setOpen(false);
+      openCreateWorktreeModal({
+        onSubmit: handleCreateWorktree,
+        resolvePath: (branch) => deriveWorktreePath(sourcePath, branch),
+      });
+    }, [handleCreateWorktree, sourcePath]);
+
     // Scroll the current worktree into view each time the dropdown opens — the
     // list mounts at scrollTop=0, so a current worktree below the fold would
     // otherwise read as "nothing selected".
@@ -565,13 +596,25 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
     const triggerTitle = detached
       ? t('workingDirectory.detachedHead', { sha: currentBranch })
       : `${currentName} · ${branchLabel}`;
+    // `git worktree list` always emits the main worktree first (a bare repo has
+    // none, so every checkout is linked). Compare against it rather than
+    // `sourcePath`, which is itself a linked worktree whenever the user picks one
+    // directly as the working directory — that would show a branch icon while
+    // standing inside a worktree.
+    const [mainWorktree] = worktrees;
+    const isLinkedWorktree =
+      !!mainWorktree &&
+      (!!mainWorktree.bare ||
+        normalizeDisplayPath(currentPath) !== normalizeDisplayPath(mainWorktree.path));
+    const triggerIcon = isLinkedWorktree ? GitForkIcon : GitBranchIcon;
 
     const trigger = (
-      <div className={styles.trigger}>
-        <Icon icon={GitForkIcon} size={12} />
-        <span className={styles.worktreeName}>{currentName}</span>
-        <span className={styles.branchInline}>{branchLabel}</span>
-        <span className={styles.count}>{worktrees.length}</span>
+      <div
+        aria-label={t('workingDirectory.worktreesHeading')}
+        className={styles.trigger}
+        role="button"
+      >
+        <Icon icon={triggerIcon} size={13} />
       </div>
     );
 
@@ -623,7 +666,8 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
                       const displayPath = getRelativeDisplayPath(worktree.path, sourcePath);
                       const disabled = isDisabled(worktree);
                       const removing = removingPaths.has(worktree.path);
-                      const removable = canRemoveWorktree(worktree, sourcePath) && !removing;
+                      const removable =
+                        canRemoveWorktree(worktree, sourcePath, mainWorktree?.path) && !removing;
 
                       return (
                         <DropdownMenuItem
@@ -696,6 +740,17 @@ const WorktreeSwitcher = memo<WorktreeSwitcherProps>(
                       );
                     })
                   )}
+                </div>
+
+                <div className={styles.createItemWrapper}>
+                  <DropdownMenuItem
+                    className={styles.createItem}
+                    closeOnClick={false}
+                    onClick={openCreateWorktree}
+                  >
+                    <Icon className={styles.createItemIcon} icon={FolderPlusIcon} size={14} />
+                    <div>{t('workingDirectory.createWorktreeAction')}</div>
+                  </DropdownMenuItem>
                 </div>
               </div>
             </DropdownMenuPopup>

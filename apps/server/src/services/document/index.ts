@@ -92,6 +92,21 @@ export class DocumentService {
     return this.documentHistoryServiceInstance;
   }
 
+  /**
+   * Whether a document participates in collaborative edit locking. Only
+   * workspace documents other members can actually open need the lock:
+   * a `visibility: 'private'` row is creator-only (buildWorkspaceWhere hides it
+   * from everyone else), so locking it can only ever conflict the creator with
+   * themselves — e.g. a stale lease left behind by a publish → unpublish flip
+   * turning every autosave into a CONFLICT loop. NULL visibility is treated as
+   * public, mirroring buildWorkspaceWhere.
+   */
+  private isCollaborativeDocument(
+    doc: Pick<DocumentItem, 'visibility' | 'workspaceId'> | null | undefined,
+  ): boolean {
+    return Boolean(this.workspaceId && doc?.workspaceId && doc.visibility !== 'private');
+  }
+
   private async deleteFileRecordAndStorage(fileId: string) {
     const file = await this.fileModel.delete(fileId);
     if (!file?.url || file.url.startsWith('internal://')) return;
@@ -285,6 +300,13 @@ export class DocumentService {
     if (!this.workspaceId)
       return { expiresAt: null, holderId: null, lockedByOther: false, ownerId: null };
 
+    // Creator-only (private-visibility) documents never take a lease — see
+    // isCollaborativeDocument. Refusing here keeps a stale client from minting
+    // a lock the write guards would then trip over.
+    const doc = await this.documentModel.findById(id);
+    if (!this.isCollaborativeDocument(doc))
+      return { expiresAt: null, holderId: null, lockedByOther: false, ownerId: null };
+
     const prevHolder = await this.editLockService.getActiveLock('document', id);
     const result = await this.editLockService.acquire('document', id, ownerId);
 
@@ -318,6 +340,12 @@ export class DocumentService {
    */
   async getDocumentLock(id: string, ownerId?: string): Promise<DocumentLockResult> {
     if (!this.workspaceId)
+      return { expiresAt: null, holderId: null, lockedByOther: false, ownerId: null };
+    // Private-visibility documents always read as unlocked (no lease can be
+    // taken on them), so a viewer of a just-unpublished page is never stranded
+    // read-only behind a leftover lease.
+    const doc = await this.documentModel.findById(id);
+    if (!this.isCollaborativeDocument(doc))
       return { expiresAt: null, holderId: null, lockedByOther: false, ownerId: null };
     const holder = await this.editLockService.getActiveLock('document', id);
     const lockedByOther = holder
@@ -374,6 +402,14 @@ export class DocumentService {
       // Diagnostic: distinguishes "no-op because workspaceId is
       // missing at runtime" from "lock actually evaluated".
       log('runWithDocumentLock skip: no workspaceId (id=%s userId=%s)', id, this.userId);
+      return fn();
+    }
+
+    // Creator-only (private-visibility) documents have no collaborators to
+    // serialize against — run without a lease, same as personal mode.
+    const targetDoc = await this.documentModel.findById(id);
+    if (!this.isCollaborativeDocument(targetDoc)) {
+      log('runWithDocumentLock skip: non-collaborative doc (id=%s userId=%s)', id, this.userId);
       return fn();
     }
 
@@ -459,7 +495,7 @@ export class DocumentService {
     // can't pollute the version timeline. The lock holder forwards its
     // `lockOwnerId` so it can still snapshot its own page (e.g. the pre-mutation
     // snapshot a Copilot edit takes) without being blocked by its own lease.
-    if (this.workspaceId) {
+    if (this.isCollaborativeDocument(currentDocument)) {
       const canWrite = await this.editLockService.canWrite('document', documentId, lockOwnerId);
       if (!canWrite) {
         throw new TRPCError({
@@ -513,9 +549,13 @@ export class DocumentService {
   /**
    * Delete document (recursively deletes children if it's a folder)
    */
-  async deleteDocument(id: string) {
+  async deleteDocument(id: string, options?: { restrictToCreator?: boolean }) {
     const document = await this.documentModel.findById(id);
     if (!document) return;
+    // Descendants created by other members are skipped, not deleted — their
+    // parentId FK is `set null`, so they get promoted to root instead of being
+    // destroyed by a non-owner's folder delete.
+    if (options?.restrictToCreator && document.userId !== this.userId) return;
 
     // If it's a folder, recursively delete all children first
     if (document.fileType === CUSTOM_FOLDER_FILE_TYPE) {
@@ -528,7 +568,7 @@ export class DocumentService {
 
       // Recursively delete all children
       for (const child of children) {
-        await this.deleteDocument(child.id);
+        await this.deleteDocument(child.id, options);
       }
 
       // Also delete all files in this folder
@@ -540,6 +580,7 @@ export class DocumentService {
       });
 
       for (const file of childFiles) {
+        if (options?.restrictToCreator && file.userId !== this.userId) continue;
         await this.deleteFileRecordAndStorage(file.id);
       }
     }
@@ -556,9 +597,18 @@ export class DocumentService {
   /**
    * Delete multiple documents in batch
    */
-  async deleteDocuments(ids: string[]) {
+  async deleteDocuments(ids: string[], options?: { restrictToCreator?: boolean }) {
+    let targetIds = ids;
+
+    // Workspace bulk deletes from non-owner members only target rows they
+    // created; the restriction also applies to each folder's recursive cascade.
+    if (options?.restrictToCreator) {
+      const rows = await this.documentModel.findByIds(ids);
+      targetIds = rows.filter((row) => row.userId === this.userId).map((row) => row.id);
+    }
+
     // Delete each document (which handles recursive deletion for folders)
-    await Promise.all(ids.map((id) => this.deleteDocument(id)));
+    await Promise.all(targetIds.map((id) => this.deleteDocument(id, options)));
   }
 
   /**
@@ -610,7 +660,7 @@ export class DocumentService {
       const contentChanged =
         historyAppended ||
         (params.content !== undefined && params.content !== currentDocument.content);
-      if (this.workspaceId && contentChanged) {
+      if (contentChanged && this.isCollaborativeDocument(currentDocument)) {
         const canWrite = await this.editLockService.canWrite('document', id, params.lockOwnerId);
         if (!canWrite) {
           throw new TRPCError({

@@ -61,6 +61,51 @@ the page. It carries only the non-duplicate narrative (仍需跟进 / 本轮验�
      Embed it like an image: `![case 2](assets/case2-streaming.gif)`. Verify
      at least the first/last frames visually (Read the GIF) before citing.
 
+   - UI (before/after comparison): capture and visually verify both original
+     screenshots. Do not ask the agent to compose them into a new image. In the
+     case's `evidence` array, pair them with a shared comparison id:
+
+     ```json
+     "evidence": [
+       {
+         "path": "assets/before.png",
+         "comparison": {
+           "id": "topic-row",
+           "role": "before",
+           "layout": "vertical",
+           "label": "副标题 11px，行高 40px"
+         }
+       },
+       {
+         "path": "assets/after.png",
+         "comparison": {
+           "id": "topic-row",
+           "role": "after",
+           "layout": "vertical",
+           "label": "副标题 12px，行高 44px"
+         }
+       }
+     ]
+     ```
+
+     The verify page renders a complete pair with each screenshot under its own
+     tinted band — red for `before`, green for `after` — so which state you are
+     looking at survives a glance. A group contains exactly one `before` and one
+     `after`, and **both halves need the same string `id`**; a half without an `id`
+     can never pair. Incomplete groups render as ordinary evidence.
+
+     Two fields are worth setting on every pair:
+
+     - **`layout`** — `horizontal` (default, side by side) or `vertical` (stacked).
+       Pick by the shape of the crop: a tall, narrow capture (a sidebar, a form,
+       a list) reads well side by side; a **wide, short strip** (a toolbar, a
+       one-line footer) must be `vertical`, because two of them in a two-column
+       grid become illegible slivers. Set it on both halves.
+     - **`label`** — the caption shown next to the role word in the band. This is
+       where the before/after contrast is actually _stated_: put the measured
+       delta on each side (`"11px，行高 40px"` vs `"12px，行高 44px"`), so the two
+       captions read as a comparison rather than repeating the case title.
+
    - CLI: exact command + trimmed output (`$CLI task list | tee "$DIR/assets/task-list.txt"`).
 
    - Network: `agent-browser network requests` dumps or HAR files.
@@ -185,6 +230,15 @@ missing; a blocked case is not a pass).
   ],
   "commit": "abc1234",
   "createdAt": "2026-06-11T15:30:00+08:00",
+  "interactionCost": {
+    "model": "goms-klm@lobe-v1",
+    "scope": "user-equivalent",
+    "totalSeconds": 8.1,
+    "activeSeconds": 6.1,
+    "waitSeconds": 2,
+    "operators": { "K": 1, "P": 2, "H": 0, "M": 2, "T_chars": 5, "R_ms": 2000 },
+    "phases": []
+  },
   "summary": {
     "total": 1,
     "passed": 1,
@@ -201,6 +255,14 @@ missing; a blocked case is not a pass).
 `score` is optional — use it when the verdict has a subjective component (UI
 polish, copy quality); omit it for purely binary runs. `verdict` is the single
 word the user reads first: `pass`, `fail`, or `partial`.
+
+`interactionCost` is optional and run-level. For UI runs driven through
+`agent-browser`, create `interaction-trace.jsonl` with
+`scripts/agent-browser-klm.mjs`, then run
+`scripts/agent-browser-klm-analyze.mjs --trace "$DIR/interaction-trace.jsonl" --result "$DIR/result.json" --write`. The summary is a user-equivalent GOMS-KLM
+estimate: physical browser actions are derived from agent-browser commands,
+while mental operators (`M`) are explicit agent estimates recorded with the
+wrapper's `mental` subcommand.
 
 When published (Step 4), `verify ingest-report` maps each case onto a check
 result: `name`→title, `status`/`result`→verdict, `observation` (or

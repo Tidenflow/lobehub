@@ -4,6 +4,7 @@ import {
   type ChatToolPayload,
   type ClientSecretPayload,
   type ExecSubAgentParams,
+  type StepActivatedSkill,
 } from '@lobechat/types';
 
 export interface ToolExecutionMemoryEmbeddingRuntime {
@@ -45,6 +46,14 @@ export interface ServerSubAgentRunResult {
   subOperationId?: string;
   /** The isolation thread holding the sub-agent's full message trace. */
   threadId: string;
+  /**
+   * The placeholder tool message the child was anchored to. Surfaced back up to
+   * the runtime so the `pauseForTools` chunk can carry `toolMessageIds` — that is
+   * what makes the client refetch and actually put this row in its store, which
+   * in turn is what lets live sub-agent progress patch onto it while the parent
+   * is parked.
+   */
+  toolMessageId?: string;
 }
 
 /**
@@ -115,8 +124,26 @@ export interface ServerAgentMemberRunner {
 }
 
 export interface ToolExecutionContext {
+  /**
+   * Skills activated so far in the conversation (activateSkill /
+   * activateTools tool results), extracted by the runtime executors from the
+   * operation's message history — the server-side equivalent of the client
+   * transport's stepContext. The skills runtime uses this to resolve skill
+   * archives for `execScript` (device `prepareSkillDirectory` + sandbox
+   * `skillZipUrls`); the raw LLM args never carry it.
+   */
+  activatedSkills?: StepActivatedSkill[];
   /** Target device ID for device proxy tool calls */
   activeDeviceId?: string;
+  /**
+   * Principal pool `activeDeviceId` lives in. `personal` when a workspace run
+   * was routed to the caller's own device via a per-user `local` override —
+   * `resolveRunWorkspaceId` then addresses gateway calls through the personal
+   * `(userId, deviceId)` pool instead of the `workspace:<id>` pool, where that
+   * device has no connection. Absent on runs without a run-start device (a
+   * mid-run activation always picks from the workspace pool).
+   */
+  activeDeviceScope?: 'personal' | 'workspace';
   /** Agent ID executing the tool call */
   agentId?: string;
   /**

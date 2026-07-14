@@ -23,6 +23,7 @@ import {
   files,
   knowledgeBases,
   messages,
+  sessionGroups,
   sessions,
   taskComments,
   taskDependencies,
@@ -166,15 +167,24 @@ export class AgentModel {
    * by their owning user, so a workspace member who isn't that owner would get
    * a broken agent. Rejects at write time rather than at execution time.
    *
+   * Only device ids INTRODUCED by this patch are checked — ids already present
+   * in `storedConfig` are grandfathered. Client patches spread the whole stored
+   * `agencyConfig` (device picker, working-dir writes), so a legacy
+   * personal-device reference left from before the agent joined the workspace
+   * (or before this guard existed) would otherwise poison every future save,
+   * including binding a perfectly valid workspace device.
+   *
    * No-op when `agentWorkspaceId` is null (personal agent — any device OK) or
    * when the patch carries no new device ids.
    */
   private assertWorkspaceDeviceBinding = async (
     agentWorkspaceId: string | null,
     agencyConfig: PartialDeep<LobeAgentAgencyConfig> | null | undefined,
+    storedConfig?: LobeAgentAgencyConfig | null,
   ): Promise<void> => {
     if (!agentWorkspaceId) return;
-    const candidates = this.collectBoundDeviceIds(agencyConfig);
+    const existing = new Set(this.collectBoundDeviceIds(storedConfig));
+    const candidates = this.collectBoundDeviceIds(agencyConfig).filter((id) => !existing.has(id));
     if (candidates.length === 0) return;
 
     const rows = await this.db
@@ -224,6 +234,24 @@ export class AgentModel {
       .select({ id: agents.id })
       .from(agents)
       .where(and(eq(agents.id, id), this.ownership()))
+      .limit(1);
+
+    return rows.length > 0;
+  };
+
+  /**
+   * Stricter than {@link existsById}: the agent must be owned (created) by this
+   * user, regardless of workspace visibility. `existsById` uses the visibility
+   * -aware ownership predicate, so a *public* workspace agent created by another
+   * member also returns true — which is only "can see", not "can edit". Callers
+   * that bind credentials/config to an agent (e.g. agent-scoped connectors) must
+   * use this so a member can't attach an account to someone else's shared agent.
+   */
+  existsOwnedById = async (id: string): Promise<boolean> => {
+    const rows = await this.db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.id, id), eq(agents.userId, this.userId)))
       .limit(1);
 
     return rows.length > 0;
@@ -511,7 +539,7 @@ export class AgentModel {
     //
     // The joined `knowledgeBases` / `files` rows also need a visibility guard
     // in the `leftJoin` ON clause: without it, a KB or file that was later
-    // flipped back to `private` via `setVisibility` (LOBE-11270) would keep
+    // flipped back to `private` via `setVisibility` would keep
     // leaking its name / description into every mounted-agent view across the
     // workspace. Enforcing the guard on the ON clause (rather than WHERE)
     // keeps the mount row in the result but nulls out the referenced entity —
@@ -793,14 +821,14 @@ export class AgentModel {
   };
 
   /**
-   * Publish a private agent into the workspace. **One-way only** — once an
-   * agent has been shared with the workspace, other members may already be
-   * using it, so we never let it slip back to `private`. Likewise the
-   * `user_id = ?` + `visibility = 'private'` guards lock the operation to
-   * the creator's own still-private agent.
+   * Publish a private agent into the workspace. The `user_id = ?` +
+   * `visibility = 'private'` guards lock the operation to the creator's own
+   * still-private agent. The inverse transition (public → private) goes
+   * through {@link setVisibility}, which the router gates to the creator or
+   * a workspace owner (LOBE-11551).
    *
    * Use the existing `update` to change other fields; visibility is the only
-   * one with this asymmetric rule.
+   * one with these authorization rules.
    */
   publishToWorkspace = async (agentId: string) => {
     return this.db
@@ -814,6 +842,66 @@ export class AgentModel {
           eq(agents.visibility, 'private'),
         ),
       );
+  };
+
+  /**
+   * Lightweight lookup used to authorize visibility changes: the agent's
+   * creator, slug and current visibility, scoped by the ownership predicate
+   * (other members' private agents resolve to `null`).
+   */
+  getAgentVisibilityMeta = async (
+    id: string,
+  ): Promise<{ slug: string | null; userId: string; visibility: 'private' | 'public' } | null> => {
+    const rows = await this.db
+      .select({ slug: agents.slug, userId: agents.userId, visibility: agents.visibility })
+      .from(agents)
+      .where(and(eq(agents.id, id), this.ownership()))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
+    return {
+      slug: row.slug,
+      userId: row.userId,
+      visibility: (row.visibility as 'private' | 'public' | null) ?? 'public',
+    };
+  };
+
+  /**
+   * Bidirectional visibility switch (LOBE-11551). Authorization (creator OR
+   * workspace owner, builtin agents excluded) is the router's responsibility —
+   * this method only applies the ownership-scoped write.
+   *
+   * Uses UPDATE … RETURNING instead of a follow-up SELECT: when a workspace
+   * owner demotes another member's agent to private, the post-update row no
+   * longer matches the visibility-aware ownership predicate, so a read-back
+   * would return 0 rows even though the write succeeded (same pattern as
+   * TaskModel.updateVisibility).
+   */
+  setVisibility = async (agentId: string, visibility: 'private' | 'public') => {
+    // A sidebar folder cannot mix visibilities (HomeRepository.processAgentList
+    // buckets grouped items by item visibility under same-visibility groups),
+    // so an agent crossing scopes while keyed to a group of the OLD scope
+    // would be emitted nowhere and vanish from the sidebar. Rehome it to the
+    // ungrouped section of its new scope when the group no longer matches.
+    const [current] = await this.db
+      .select({ groupVisibility: sessionGroups.visibility })
+      .from(agents)
+      .leftJoin(sessionGroups, eq(agents.sessionGroupId, sessionGroups.id))
+      .where(and(eq(agents.id, agentId), this.ownership()))
+      .limit(1);
+    const groupVisibility = current?.groupVisibility as 'private' | 'public' | null | undefined;
+    const clearGroup = groupVisibility != null && groupVisibility !== visibility;
+
+    const [updated] = await this.db
+      .update(agents)
+      .set({
+        updatedAt: new Date(),
+        visibility,
+        ...(clearGroup ? { sessionGroupId: null } : {}),
+      })
+      .where(and(eq(agents.id, agentId), this.ownership()))
+      .returning();
+    return updated ?? null;
   };
 
   touchUpdatedAt = async (agentId: string) => {
@@ -871,7 +959,11 @@ export class AgentModel {
 
     if (!agent) return;
 
-    await this.assertWorkspaceDeviceBinding(agent.workspaceId, data.agencyConfig);
+    await this.assertWorkspaceDeviceBinding(
+      agent.workspaceId,
+      data.agencyConfig,
+      agent.agencyConfig,
+    );
 
     // First process the params field: undefined means delete, null means disable flag
     const existingParams = agent.params ?? {};
@@ -1086,6 +1178,73 @@ export class AgentModel {
    * within that workspace (`private` = only the target user sees it,
    * `public` = every member does). Ignored when moving to a personal account.
    */
+  /**
+   * Whether the agent's transfer cascade (topics / messages / threads / tasks
+   * linked to it) contains rows created by someone else. Transfers rehome every
+   * cascaded row, so non-owner members must not move an agent that carries
+   * teammates' conversations.
+   */
+  transferHasForeignRows = async (agentId: string): Promise<boolean> => {
+    const links = await this.db
+      .select({ sessionId: agentsToSessions.sessionId })
+      .from(agentsToSessions)
+      .where(eq(agentsToSessions.agentId, agentId));
+    const sessionIds = links.map((link) => link.sessionId);
+
+    // A member who merely opened the shared agent already owns a linked
+    // session, even with no topics/messages yet — the transfer would rewrite
+    // that session row too.
+    if (sessionIds.length > 0) {
+      const [foreignSession] = await this.db
+        .select({ id: sessions.id })
+        .from(sessions)
+        .where(and(inArray(sessions.id, sessionIds), ne(sessions.userId, this.userId)))
+        .limit(1);
+      if (foreignSession) return true;
+    }
+
+    const topicWhere =
+      sessionIds.length > 0
+        ? or(inArray(topics.sessionId, sessionIds), eq(topics.agentId, agentId))
+        : eq(topics.agentId, agentId);
+    const [foreignTopic] = await this.db
+      .select({ id: topics.id })
+      .from(topics)
+      .where(and(topicWhere, ne(topics.userId, this.userId)))
+      .limit(1);
+    if (foreignTopic) return true;
+
+    const messageWhere =
+      sessionIds.length > 0
+        ? or(inArray(messages.sessionId, sessionIds), eq(messages.agentId, agentId))
+        : eq(messages.agentId, agentId);
+    const [foreignMessage] = await this.db
+      .select({ id: messages.id })
+      .from(messages)
+      .where(and(messageWhere, ne(messages.userId, this.userId)))
+      .limit(1);
+    if (foreignMessage) return true;
+
+    const [foreignThread] = await this.db
+      .select({ id: threads.id })
+      .from(threads)
+      .where(and(eq(threads.agentId, agentId), ne(threads.userId, this.userId)))
+      .limit(1);
+    if (foreignThread) return true;
+
+    const [foreignTask] = await this.db
+      .select({ id: tasks.id })
+      .from(tasks)
+      .where(
+        and(
+          or(eq(tasks.assigneeAgentId, agentId), eq(tasks.createdByAgentId, agentId)),
+          ne(tasks.createdByUserId, this.userId),
+        ),
+      )
+      .limit(1);
+    return !!foreignTask;
+  };
+
   transferAgent = async (
     agentId: string,
     targetWorkspaceId: string | null,
@@ -1173,6 +1332,9 @@ export class AgentModel {
       // 4. Update the agent record.
       //    Only apply visibility when moving into a workspace — visibility is
       //    a no-op in personal scope where every row is implicitly private.
+      //    `sessionGroupId` is cleared because sidebar folders belong to the
+      //    source scope (same rationale as dropping chatGroupsAgents below);
+      //    a stale reference would orphan the agent out of the target sidebar.
       const visibilityUpdate =
         targetWorkspaceId && targetVisibility ? { visibility: targetVisibility } : {};
       await trx
@@ -1181,6 +1343,7 @@ export class AgentModel {
           ...ownershipUpdate,
           ...visibilityUpdate,
           agencyConfig: nextAgencyConfig,
+          sessionGroupId: null,
           slug,
           updatedAt: new Date(),
         })
@@ -1195,7 +1358,12 @@ export class AgentModel {
       const sessionIds = links.map((l) => l.sessionId);
 
       if (sessionIds.length > 0) {
-        await trx.update(sessions).set(ownershipUpdate).where(inArray(sessions.id, sessionIds));
+        // `groupId` is cleared for the same reason as the agent's
+        // `sessionGroupId`: folders stay in the source scope.
+        await trx
+          .update(sessions)
+          .set({ ...ownershipUpdate, groupId: null })
+          .where(inArray(sessions.id, sessionIds));
       }
 
       await trx

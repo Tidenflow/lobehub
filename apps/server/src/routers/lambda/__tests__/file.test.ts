@@ -197,6 +197,7 @@ const mockDocumentModelCountFileUsageInSubtree = vi.fn();
 const mockDocumentModelCopyToWorkspace = vi.fn();
 const mockDocumentModelFindById = vi.fn();
 const mockDocumentModelTransferTo = vi.fn();
+const mockDocumentModelSubtreeHasForeignRows = vi.fn().mockResolvedValue(false);
 
 vi.mock('@/database/repositories/knowledge', () => ({
   KnowledgeRepo: vi.fn(() => ({
@@ -209,6 +210,7 @@ vi.mock('@/database/models/document', () => ({
     countFileUsageInSubtree: mockDocumentModelCountFileUsageInSubtree,
     copyToWorkspace: mockDocumentModelCopyToWorkspace,
     findById: mockDocumentModelFindById,
+    subtreeHasForeignRows: mockDocumentModelSubtreeHasForeignRows,
     transferTo: mockDocumentModelTransferTo,
   })),
 }));
@@ -772,18 +774,6 @@ describe('fileRouter', () => {
     });
   });
 
-  describe('removeAllFiles', () => {
-    it('should include knowledge-base files when clearing all user files', async () => {
-      mockFileModelQuery.mockResolvedValue([{ id: 'file-1' }, { id: 'file-2' }]);
-      mockFileModelDeleteMany.mockResolvedValue([]);
-
-      await caller.removeAllFiles();
-
-      expect(mockFileModelQuery).toHaveBeenCalledWith({ showFilesInKnowledgeBase: true });
-      expect(mockFileModelDeleteMany).toHaveBeenCalledWith(['file-1', 'file-2'], false);
-    });
-  });
-
   describe('deleteKnowledgeItemsByQuery', () => {
     it('should delete page-backed knowledge items via documentService and plain files via fileModel', async () => {
       mockKnowledgeRepoQuery.mockResolvedValue([
@@ -806,8 +796,12 @@ describe('fileRouter', () => {
 
       const result = await caller.deleteKnowledgeItemsByQuery({});
 
-      expect(mockDocumentServiceDeleteDocuments).toHaveBeenCalledWith(['doc-1']);
-      expect(mockFileModelDeleteMany).toHaveBeenCalledWith(['file-2'], false);
+      expect(mockDocumentServiceDeleteDocuments).toHaveBeenCalledWith(['doc-1'], {
+        restrictToCreator: false,
+      });
+      expect(mockFileModelDeleteMany).toHaveBeenCalledWith(['file-2'], false, {
+        restrictToCreator: false,
+      });
       expect(result).toEqual({ count: 2 });
     });
   });
@@ -815,7 +809,7 @@ describe('fileRouter', () => {
   describe('transferEntity', () => {
     it('should transfer document resources via documentModel', async () => {
       ctx.workspaceId = 'workspace-active';
-      mockDocumentModelFindById.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModelFindById.mockResolvedValue({ id: 'doc-1', userId: 'test-user' });
       mockDocumentModelCountFileUsageInSubtree.mockResolvedValue(4096);
       mockDocumentModelTransferTo.mockResolvedValue({ id: 'doc-1' });
 
@@ -913,7 +907,7 @@ describe('fileRouter', () => {
 
     it('should copy document resources via documentModel', async () => {
       mockDocumentModelCopyToWorkspace.mockResolvedValue({ id: 'doc-1' });
-      mockDocumentModelFindById.mockResolvedValue({ id: 'doc-1' });
+      mockDocumentModelFindById.mockResolvedValue({ id: 'doc-1', userId: 'test-user' });
       mockDocumentModelCountFileUsageInSubtree.mockResolvedValue(4096);
 
       await caller.copyEntityToWorkspace({

@@ -10,6 +10,7 @@ import {
   type TopicSortBy,
 } from '@/types/topic';
 import {
+  getTopicSortTime,
   groupTopicsByProject,
   groupTopicsByStatus,
   groupTopicsByTime,
@@ -18,6 +19,7 @@ import {
 
 import { type ChatStoreState } from '../../initialState';
 import { topicMapKey } from '../../utils/topicMapKey';
+import { operationSelectors } from '../operation/selectors';
 import { type TopicData } from './initialState';
 
 // Helper selector: get current topic data based on session context
@@ -89,10 +91,13 @@ const currentTopicWorkingDirectory = (s: ChatStoreState): string | undefined => 
   const activeTopic = currentActiveTopic(s);
   if (!activeTopic) return;
 
+  // Route the raw `workingDirectory` through the extractor too: it is typed as a
+  // string, but a malformed legacy topic may have persisted a `WorkingDirConfig`
+  // object into it (see #17050 and `getTopicMetadataWorkingDirectorySourcePath`),
+  // and this selector's declared `string | undefined` must hold at runtime.
   if (isDesktop) {
-    return (
-      getWorkingDirEffectivePath(activeTopic.metadata?.workingDirectoryConfig) ??
-      activeTopic.metadata?.workingDirectory
+    return getWorkingDirEffectivePath(
+      activeTopic.metadata?.workingDirectoryConfig ?? activeTopic.metadata?.workingDirectory,
     );
   }
 
@@ -100,31 +105,51 @@ const currentTopicWorkingDirectory = (s: ChatStoreState): string | undefined => 
   const meta = activeTopic.metadata;
   return (
     meta?.repos?.[0] ??
-    getWorkingDirEffectivePath(meta?.workingDirectoryConfig) ??
-    meta?.workingDirectory
+    getWorkingDirEffectivePath(meta?.workingDirectoryConfig ?? meta?.workingDirectory)
   );
 };
 
 const isCreatingTopic = (s: ChatStoreState) => s.creatingTopic;
+
+/**
+ * Whether a send from the new-topic view is still in flight — no active topic
+ * yet, while the running send owns creation of the real topic (the `_new`
+ * context only holds optimistic tmp_* messages until then). While true,
+ * `openNewTopicOrSaveTopic` is a no-op, so its entry buttons should be
+ * disabled to make the blocked window visible instead of silently ignoring
+ * the click.
+ */
+const isNewTopicSendInFlight = (s: ChatStoreState): boolean =>
+  !s.activeTopicId &&
+  operationSelectors.isInputLoadingByContext({
+    agentId: s.activeAgentId,
+    groupId: s.activeGroupId,
+    threadId: s.activeThreadId,
+    topicId: s.activeTopicId,
+  })(s);
 const isUndefinedTopics = (s: ChatStoreState) => !currentTopics(s);
 const isInSearchMode = (s: ChatStoreState) => s.inSearchingMode;
 const isSearchingTopic = (s: ChatStoreState) => s.isSearchingTopic;
 
 const sortTopics = (topics: ChatTopic[], sortBy: TopicSortBy): ChatTopic[] => {
   const field = sortBy === 'createdAt' ? 'createdAt' : 'updatedAt';
-  return [...topics].sort((a, b) => b[field] - a[field]);
+  return [...topics].sort((a, b) => getTopicSortTime(b, field) - getTopicSortTime(a, field));
 };
 
 // Limit topics for sidebar display based on user's page size preference
 const displayTopicsForSidebar =
-  (pageSize: number, sortBy: TopicSortBy = 'updatedAt') =>
+  (pageSize: number, sortBy: TopicSortBy = 'updatedAt', includeCompleted = true) =>
   (s: ChatStoreState): ChatTopic[] | undefined => {
     const topics = currentTopicsWithoutCron(s);
     if (!topics) return undefined;
 
+    const visibleTopics = includeCompleted
+      ? topics
+      : topics.filter((topic) => topic.status !== 'completed');
+
     // Favorites first, then sorted by the chosen timestamp, then page-sliced
-    const favTopics = topics.filter((t) => t.favorite);
-    const rest = topics.filter((t) => !t.favorite);
+    const favTopics = visibleTopics.filter((t) => t.favorite);
+    const rest = visibleTopics.filter((t) => !t.favorite);
     return [...sortTopics(favTopics, sortBy), ...sortTopics(rest, sortBy)].slice(0, pageSize);
   };
 
@@ -186,9 +211,14 @@ const groupedTopicsSelector =
   };
 
 const groupedTopicsForSidebar =
-  (pageSize: number, sortBy: TopicSortBy = 'updatedAt', groupMode: TopicGroupMode = 'byTime') =>
+  (
+    pageSize: number,
+    sortBy: TopicSortBy = 'updatedAt',
+    groupMode: TopicGroupMode = 'byTime',
+    includeCompleted = true,
+  ) =>
   (s: ChatStoreState): GroupedTopic[] => {
-    const limitedTopics = displayTopicsForSidebar(pageSize, sortBy)(s);
+    const limitedTopics = displayTopicsForSidebar(pageSize, sortBy, includeCompleted)(s);
     if (!limitedTopics) return [];
     // Topics actively streaming on this client surface under "running" even
     // though their persisted status says otherwise — that's the one client-only
@@ -266,6 +296,7 @@ export const topicSelectors = {
   isExpandingPageSize,
   isInSearchMode,
   isLoadingMoreTopics,
+  isNewTopicSendInFlight,
   isSearchingTopic,
   isUndefinedTopics,
   loadMoreTopicsError,

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import type {
   Agent,
   AgentRuntimeContext,
@@ -6,6 +8,7 @@ import type {
 } from '@lobechat/agent-runtime';
 import {
   AgentRuntime,
+  extractActivatedToolIdsFromMessages,
   findInMessages,
   GeneralChatAgent,
   isParkedStatus,
@@ -29,6 +32,7 @@ import {
 import {
   type ChatToolPayload,
   type ExecSubAgentParams,
+  type ExecSubAgentResult,
   type ExecVirtualSubAgentParams,
   type UIChatMessage,
 } from '@lobechat/types';
@@ -112,6 +116,9 @@ const ASYNC_TOOL_VERIFY_MAX_ATTEMPTS = 5;
 /** Hard ceiling on a single backoff delay so late attempts don't overshoot. */
 const ASYNC_TOOL_VERIFY_MAX_DELAY_MS = 240_000;
 
+const STEP_LOCK_TTL_SECONDS = 120;
+const STEP_LOCK_HEARTBEAT_MS = 30_000;
+
 /**
  * Exponential backoff delay for the Nth (1-based) watchdog re-check:
  * 15s, 30s, 60s, 120s, 240s, capped at {@link ASYNC_TOOL_VERIFY_MAX_DELAY_MS}.
@@ -121,6 +128,9 @@ const asyncToolVerifyDelayMs = (attempt: number): number =>
     ASYNC_TOOL_VERIFY_DELAY_MS * 2 ** (Math.max(1, attempt) - 1),
     ASYNC_TOOL_VERIFY_MAX_DELAY_MS,
   );
+
+const createStepLockOwner = (operationId: string, stepIndex: number): string =>
+  `${operationId}:${stepIndex}:${process.pid}:${Date.now()}:${randomUUID()}`;
 
 /**
  * Format error for storage in message pluginError metadata.
@@ -193,13 +203,13 @@ export interface AgentRuntimeDelegate {
    * (AiAgentService.execSubAgent → execAgent: agent-config resolution, tool
    * engine, context engineering, createOperation).
    */
-  execSubAgent?: (params: ExecSubAgentParams) => Promise<unknown>;
+  execSubAgent?: (params: ExecSubAgentParams) => Promise<ExecSubAgentResult>;
   /**
    * Fork a `lobe-agent.callSubAgent` virtual child run. The child is marked as a
    * sub-agent and owns the completion bridge that backfills the parent tool
    * placeholder before resuming the parked parent operation.
    */
-  execVirtualSubAgent?: (params: ExecVirtualSubAgentParams) => Promise<unknown>;
+  execVirtualSubAgent?: (params: ExecVirtualSubAgentParams) => Promise<ExecSubAgentResult>;
 }
 
 export interface AgentRuntimeServiceOptions {
@@ -338,6 +348,34 @@ export class AgentRuntimeService {
     this.setupLocalExecutionCallback();
   }
 
+  private startStepLockHeartbeat(
+    operationId: string,
+    stepIndex: number,
+    ownerId: string,
+  ): () => void {
+    const timer = setInterval(() => {
+      this.coordinator
+        .refreshStepLock(operationId, stepIndex, STEP_LOCK_TTL_SECONDS, ownerId)
+        .then((refreshed) => {
+          if (!refreshed) {
+            log(
+              '[%s][%d] Step lock heartbeat did not refresh; ownership may have changed',
+              operationId,
+              stepIndex,
+            );
+          }
+        })
+        .catch((error) => {
+          log('[%s][%d] Step lock heartbeat failed: %O', operationId, stepIndex, error);
+        });
+    }, STEP_LOCK_HEARTBEAT_MS);
+
+    const timerWithUnref = timer as { unref?: () => void };
+    timerWithUnref.unref?.();
+
+    return () => clearInterval(timer);
+  }
+
   /**
    * Setup execution callback for LocalQueueServiceImpl
    * This breaks the circular dependency by using callback injection
@@ -393,6 +431,7 @@ export class AgentRuntimeService {
   async createOperation(params: OperationCreationParams): Promise<OperationCreationResult> {
     const {
       activeDeviceId,
+      activeDeviceScope,
       operationId,
       initialContext,
       agentConfig,
@@ -478,7 +517,21 @@ export class AgentRuntimeService {
       );
 
       // Initialize operation state - create state before saving
+      const activatableToolIds = new Set(operationToolSet.activatableToolIds ?? []);
+      const restoredActivatedToolIds = extractActivatedToolIdsFromMessages(initialMessages)?.filter(
+        (id) => activatableToolIds.has(id),
+      );
+      const activatedStepTools = restoredActivatedToolIds?.length
+        ? restoredActivatedToolIds.map((id) => ({
+            activatedAtStep: initialStepCount,
+            id,
+            manifest: operationToolSet.manifestMap[id],
+            source: 'discovery' as const,
+          }))
+        : undefined;
+
       const initialState = {
+        activatedStepTools,
         createdAt: new Date().toISOString(),
         // Store initialContext for executeSync to use
         initialContext,
@@ -487,6 +540,7 @@ export class AgentRuntimeService {
         messages: initialMessages,
         metadata: {
           activeDeviceId,
+          activeDeviceScope,
           agentConfig,
           agentGroup,
           botContext,
@@ -700,8 +754,42 @@ export class AgentRuntimeService {
     }
 
     // ===== Distributed lock: prevent duplicate execution from QStash retries =====
-    const claimed = await this.coordinator.tryClaimStep(operationId, stepIndex, 35);
+    const stepLockOwner = createStepLockOwner(operationId, stepIndex);
+    const claimed = await this.coordinator.tryClaimStep(
+      operationId,
+      stepIndex,
+      STEP_LOCK_TTL_SECONDS,
+      stepLockOwner,
+    );
     if (!claimed) {
+      let currentState: AgentState | null | undefined = null;
+      try {
+        currentState = await this.coordinator.loadAgentState(operationId);
+      } catch (error) {
+        log(
+          '[%s][%d] Failed to load state while handling step lock conflict: %O',
+          operationId,
+          stepIndex,
+          error,
+        );
+      }
+
+      const currentStepCount = currentState?.stepCount;
+      if (currentState && typeof currentStepCount === 'number' && currentStepCount > stepIndex) {
+        log(
+          '[%s][%d] Step lock conflict is stale (stepCount=%d), skipping',
+          operationId,
+          stepIndex,
+          currentStepCount,
+        );
+        return {
+          nextStepScheduled: false,
+          state: currentState,
+          stepResult: null,
+          success: true,
+        };
+      }
+
       log(
         '[%s][%d] Step lock conflict — another instance is executing this step, returning locked',
         operationId,
@@ -714,6 +802,12 @@ export class AgentRuntimeService {
         success: false,
       };
     }
+
+    const stopStepLockHeartbeat = this.startStepLockHeartbeat(
+      operationId,
+      stepIndex,
+      stepLockOwner,
+    );
 
     // Hoisted so the error-path snapshot finalize can record an
     // approximate startedAt for the failing step. The inner `startAt` at the
@@ -1038,6 +1132,8 @@ export class AgentRuntimeService {
           type: 'step_complete',
         });
 
+        await this.publishSubAgentProgress(stepResult.newState, stepIndex);
+
         // Build enhanced step completion log & presentation data
         const { presentation: stepPresentationData, summary: stepSummary } = buildStepPresentation(
           stepResult,
@@ -1255,6 +1351,7 @@ export class AgentRuntimeService {
             error: newStateError
               ? {
                   attribution: newStateError.attribution,
+                  body: newStateError.body,
                   category: newStateError.category,
                   countAsFailure: newStateError.countAsFailure,
                   httpStatus: newStateError.httpStatus,
@@ -1365,6 +1462,7 @@ export class AgentRuntimeService {
         completionReason: 'error',
         error: {
           attribution: formattedError.attribution,
+          body: formattedError.body,
           category: formattedError.category,
           countAsFailure: formattedError.countAsFailure,
           httpStatus: formattedError.httpStatus,
@@ -1374,17 +1472,19 @@ export class AgentRuntimeService {
           severity: formattedError.severity,
           type: String(formattedError.type),
         },
-        failedStep: { startedAt: stepStartAt, stepIndex },
+        failedStep: {
+          startedAt: stepStartAt,
+          stepIndex,
+          stepType: formattedError.category === 'provider' ? 'call_llm' : 'call_tool',
+        },
         state: finalStateWithError,
       });
 
       throw error;
     } finally {
       invokeAgentSpan.end();
-      // Release lock so legitimate retries or next operations can proceed.
-      // If Vercel force-kills the process, this won't execute — the lock
-      // auto-expires after TTL (35s), allowing QStash retries to self-heal.
-      await this.coordinator.releaseStepLock(operationId, stepIndex);
+      stopStepLockHeartbeat();
+      await this.coordinator.releaseStepLock(operationId, stepIndex, stepLockOwner);
     }
   }
 
@@ -1939,6 +2039,50 @@ export class AgentRuntimeService {
   }
 
   /**
+   * Stream a `callSubAgent` child's running totals to the client, once per step.
+   *
+   * Addressed to the PARENT's operationId, not the child's: the client opens one
+   * WebSocket per operation and never subscribes to the child's channel. The
+   * parent's channel is still live because parking at `waiting_for_async_tool`
+   * deliberately does not publish a stream-end event (see
+   * `AgentRuntimeCoordinator.STREAM_END_STATUSES`).
+   *
+   * Rides `step_complete` rather than a new event type because `AgentStreamEventType`
+   * is a closed union shared with the out-of-repo gateway worker; `phase` is the
+   * established discriminator and unknown phases are ignored by older clients.
+   *
+   * The three stat fields are read from exactly the same state paths that
+   * `completeSubAgentBridge` uses for its final backfill, so the live numbers
+   * converge on the persisted ones instead of jumping when the run ends.
+   *
+   * Best-effort: a publish failure must not fail the sub-agent's step.
+   */
+  private async publishSubAgentProgress(state: AgentState, stepIndex: number): Promise<void> {
+    const anchor = state?.metadata?.subAgentProgress as
+      { parentOperationId: string; toolMessageId: string } | undefined;
+    if (!anchor?.parentOperationId || !anchor.toolMessageId) return;
+
+    try {
+      await this.streamManager.publishStreamEvent(anchor.parentOperationId, {
+        data: {
+          model: state?.modelRuntimeConfig?.model,
+          phase: 'subagent_progress',
+          toolMessageId: anchor.toolMessageId,
+          totalCost: state?.cost?.total,
+          totalInputTokens: state?.usage?.llm?.tokens?.input,
+          totalOutputTokens: state?.usage?.llm?.tokens?.output,
+          totalTokens: state?.usage?.llm?.tokens?.total,
+          totalToolCalls: state?.usage?.tools?.totalCalls,
+        },
+        stepIndex,
+        type: 'step_complete',
+      });
+    } catch (error) {
+      log('[%s] failed to publish sub-agent progress (non-fatal): %O', state?.operationId, error);
+    }
+  }
+
+  /**
    * Sub-agent completion bridge for the server `callSubAgent` deferred-tool
    * path. Runs when a child sub-agent op reaches a terminal state — invoked
    * in-process by the child's `onComplete` hook handler (local mode) or via
@@ -2016,6 +2160,14 @@ export class AgentRuntimeService {
         model: finalState?.modelRuntimeConfig?.model,
         status: failed ? 'error' : 'completed',
         threadId,
+        // The child's spend rides on this anchor row so the parent's usage tray can
+        // account for it. The tray sums per-MESSAGE usage, and the child's own
+        // assistant messages live in an isolation thread the parent never loads —
+        // this row is the only place the child's cost surfaces in the parent's own
+        // message list.
+        totalCost: finalState?.cost?.total,
+        totalInputTokens: finalState?.usage?.llm?.tokens?.input,
+        totalOutputTokens: finalState?.usage?.llm?.tokens?.output,
         totalToolCalls: finalState?.usage?.tools?.totalCalls,
         totalTokens: finalState?.usage?.llm?.tokens?.total,
       },
@@ -2205,6 +2357,14 @@ export class AgentRuntimeService {
         model: finalState?.modelRuntimeConfig?.model,
         status: failed ? 'error' : 'completed',
         threadId,
+        // The child's spend rides on this anchor row so the parent's usage tray can
+        // account for it. The tray sums per-MESSAGE usage, and the child's own
+        // assistant messages live in an isolation thread the parent never loads —
+        // this row is the only place the child's cost surfaces in the parent's own
+        // message list.
+        totalCost: finalState?.cost?.total,
+        totalInputTokens: finalState?.usage?.llm?.tokens?.input,
+        totalOutputTokens: finalState?.usage?.llm?.tokens?.output,
         totalToolCalls: finalState?.usage?.tools?.totalCalls,
         totalTokens: finalState?.usage?.llm?.tokens?.total,
       },
@@ -2500,7 +2660,10 @@ export class AgentRuntimeService {
     // Create streaming executor context
     const executorContext: RuntimeExecutorContext = {
       agentConfig: metadata?.agentConfig,
-      allowEarlyFinalAnswerVisibleOutputEnd: !this.agentFactory,
+      // The factory may be a Graph-aware dispatcher that still returns the
+      // default agent for ordinary conversations. Keep the early visible
+      // output end behavior tied to the actual agent, not factory presence.
+      allowEarlyFinalAnswerVisibleOutputEnd: agent instanceof GeneralChatAgent,
       botContext: metadata?.botContext,
       botPlatformContext: metadata?.botPlatformContext,
       discordContext: metadata?.discordContext,

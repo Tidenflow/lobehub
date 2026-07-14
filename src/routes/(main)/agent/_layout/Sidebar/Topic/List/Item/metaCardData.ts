@@ -7,10 +7,7 @@ import { cssVar } from 'antd-style';
 import type { LucideIcon } from 'lucide-react';
 import { GitMerge, GitPullRequestArrow, GitPullRequestClosed } from 'lucide-react';
 
-import { isDesktop } from '@/const/version';
-
-const getDirName = (path: string) =>
-  path.replaceAll('\\', '/').split('/').findLast(Boolean) || path;
+import { getConfigRepoType, getWorkingDirectoryName } from '@/helpers/workingDirectoryPath';
 
 export type PullRequestState = 'open' | 'merged' | 'closed';
 
@@ -59,8 +56,8 @@ export const getTopicMetaCard = (metadata: ChatTopicMetadata | undefined) => {
     branch: git.branch,
     detached: git.detached,
     pullRequest: git.github?.pullRequest ?? undefined,
-    repoName: sourcePath ? getDirName(sourcePath) : undefined,
-    repoType: config.repoType ?? (isDesktop ? undefined : ('github' as const)),
-    worktreeName: isWorktree && effectivePath ? getDirName(effectivePath) : undefined,
+    repoName: sourcePath ? getWorkingDirectoryName(sourcePath) : undefined,
+    repoType: getConfigRepoType(config),
+    worktreeName: isWorktree && effectivePath ? getWorkingDirectoryName(effectivePath) : undefined,
   };
 };

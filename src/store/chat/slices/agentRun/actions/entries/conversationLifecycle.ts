@@ -52,7 +52,7 @@ import { buildRunLifecycle } from '@/store/chat/slices/agentRun/actions/lifecycl
 import type { RunScope } from '@/store/chat/slices/agentRun/actions/lifecycle/types';
 import { resolveHeteroResume } from '@/store/chat/slices/agentRun/actions/transports/hetero/heteroResume';
 import type { OperationType, QueuedFile } from '@/store/chat/slices/operation/types';
-import { AI_RUNTIME_OPERATION_TYPES } from '@/store/chat/slices/operation/types';
+import { QUEUE_BLOCKING_OPERATION_TYPES } from '@/store/chat/slices/operation/types';
 import { PortalViewType } from '@/store/chat/slices/portal/initialState';
 import { chatPortalSelectors } from '@/store/chat/slices/portal/selectors';
 import { type ChatStore } from '@/store/chat/store';
@@ -151,10 +151,7 @@ const isAbortError = (error: unknown, abortController?: AbortController) =>
 const createAbortError = () =>
   Object.assign(new Error('Compression cancelled'), { name: 'AbortError' });
 
-const QUEUE_BLOCKING_OPERATION_TYPES = new Set<OperationType>([
-  ...AI_RUNTIME_OPERATION_TYPES,
-  'sendMessage',
-]);
+const QUEUE_BLOCKING_OPERATION_TYPE_SET = new Set<OperationType>(QUEUE_BLOCKING_OPERATION_TYPES);
 
 const attachSendTimeMetadataToUserMessage = (
   messages: UIChatMessage[],
@@ -276,6 +273,7 @@ export class ConversationLifecycleActionImpl {
       executionTarget: agentConfig?.agencyConfig?.executionTarget,
       heterogeneousProvider,
       isGatewayMode: this.#get().isGatewayModeEnabled(agentId),
+      isWorkspaceAgent: agentByIdSelectors.isWorkspaceAgentById(agentId)(getAgentStoreState()),
       // Callers that need to pin the runtime (e.g. task topics that were
       // started server-side via runTask) pass `forceRuntime` to override
       // the agent's local/cloud preference.
@@ -425,7 +423,9 @@ export class ConversationLifecycleActionImpl {
     const contextOpIds = this.#get().operationsByContext[currentContextKey] || [];
     const runningQueueBlockingOp = contextOpIds
       .map((id) => this.#get().operations[id])
-      .find((op) => op && QUEUE_BLOCKING_OPERATION_TYPES.has(op.type) && op.status === 'running');
+      .find(
+        (op) => op && QUEUE_BLOCKING_OPERATION_TYPE_SET.has(op.type) && op.status === 'running',
+      );
 
     if (runningQueueBlockingOp) {
       // Snapshot file previews so the tray can render thumbnails AND the
@@ -802,10 +802,17 @@ export class ConversationLifecycleActionImpl {
         return;
       }
 
-      // Update context with server-created topicId
+      // Update context with server-created topicId. Once the server has returned a
+      // persisted topic, the hetero stream must target the real topic bucket; keeping
+      // `isNew` would route chunks to `main_<agent>_<topic>_new`.
+      const heteroTopicId = heteroData.topicId ?? operationContext.topicId;
+      const shouldResolveNewTopicKey = !!heteroTopicId && operationContext.scope !== 'thread';
       const heteroContext = {
         ...operationContext,
-        topicId: heteroData.topicId ?? operationContext.topicId,
+        // startOperation inherits from the parent op before merging this context.
+        // Use an explicit false so the child exec op does not inherit `isNew: true`.
+        ...(shouldResolveNewTopicKey ? { isNew: false } : {}),
+        topicId: heteroTopicId,
       };
       const heteroResponseMeta = heteroData as SendMessageServerResponseMeta;
       const heteroMessageKey = messageMapKey(heteroContext);
@@ -845,6 +852,12 @@ export class ConversationLifecycleActionImpl {
           clearNewKey: true,
           skipRefreshMessage: true,
         });
+        // resolveOptimisticTopic migrated the optimistic topic's loading owner
+        // onto the real id; it is released in the executor `finally` below —
+        // NOT here — because the persisted `status === 'running'` (the run
+        // spinner's other driver) is only written after startSession resolves,
+        // so releasing before the executor takes over would blank the sidebar
+        // spinner during a slow CLI startup.
       }
 
       // Clean up temp messages
@@ -946,6 +959,16 @@ export class ConversationLifecycleActionImpl {
           message: e instanceof Error ? e.message : 'Unknown error',
           type: 'HeterogeneousAgentError',
         });
+      } finally {
+        // Release the creation owner migrated by resolveOptimisticTopic (run
+        // end no longer clears topicLoadingIds since #16745, so without this
+        // the sidebar spinner sticks forever). Held until the run settles so
+        // the spinner stays continuous through the pre-`running` startup gap;
+        // it can't mask `waitingForHuman` — the sidebar item renders that
+        // state with higher priority than the running icon.
+        if (optimisticTopic && optimisticTopicResolved && heteroData.topicId) {
+          this.#get().internal_updateTopicLoading(heteroData.topicId, false);
+        }
       }
 
       return {
@@ -1001,6 +1024,19 @@ export class ConversationLifecycleActionImpl {
         // the new topic, so the shared hook reads the persisted conversation from
         // the store and titles it. Fire-and-forget.
         if (result.topicId) {
+          // executeGatewayAgent resolved the optimistic topic row via
+          // internal_replaceTopicId, which migrates its topicLoadingIds owner
+          // onto the real topic id. From here the run spinner is owned by the
+          // persisted `status === 'running'` (#16745 removed the transports'
+          // run-end topicLoadingIds clears), so release the migrated creation
+          // owner now — with no release left downstream, the sidebar spinner
+          // would stick forever after the run completes.
+          // No `optimisticTopicResolved = true` here: the gateway branch
+          // returns before the client-mode code that reads it.
+          if (optimisticTopic && optimisticTopicActive) {
+            this.#get().internal_updateTopicLoading(result.topicId, false);
+            optimisticTopicActive = false;
+          }
           void sendRunLifecycle
             .afterUserMessagePersisted({
               assistantMessageId: result.assistantMessageId,
@@ -1160,11 +1196,14 @@ export class ConversationLifecycleActionImpl {
         this.#get().updateOperationMetadata(operationId, { createdTopicId: data.topicId });
         void Promise.resolve(this.#get().refreshTopic()).catch(console.error);
       } else if (operationContext.topicId) {
-        // Optimistically update topic's updatedAt so sidebar re-groups immediately
+        // Optimistically bump the sort key (`sortUpdatedAt`, the sidebar's activity-time
+        // sort/group key) so the topic jumps to the top immediately, before the SWR
+        // refetch returns the server's fresh `topicActivityAt`. Bumping `updatedAt` here
+        // would no longer reorder anything — the sidebar sorts by `sortUpdatedAt`. (LOBE-11543)
         this.#get().internal_dispatchTopic({
           type: 'updateTopic',
           id: operationContext.topicId,
-          value: { updatedAt: Date.now() },
+          value: { sortUpdatedAt: Date.now() },
         });
       }
 
@@ -1561,6 +1600,9 @@ export class ConversationLifecycleActionImpl {
           heterogeneousProvider: parentAgentConfig?.agencyConfig?.heterogeneousProvider,
           inPortalThread,
           isGatewayMode: this.#get().isGatewayModeEnabled(context.agentId),
+          isWorkspaceAgent: context.agentId
+            ? agentByIdSelectors.isWorkspaceAgentById(context.agentId)(getAgentStoreState())
+            : false,
           messages: messagesWithInstruction,
           parentOperationId: operationId,
         },

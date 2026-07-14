@@ -1,4 +1,4 @@
-import { InsertChatGroupSchema } from '@lobechat/types';
+import { AgentPluginEntrySchema, InsertChatGroupSchema } from '@lobechat/types';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
@@ -16,6 +16,11 @@ import { EditLockService } from '@/server/services/editLock';
 import { publishResourceEvent } from '@/server/services/resourceEvents';
 import { hasWorkspaceScopedPermission } from '@/server/services/workspacePermission';
 import { TransferErrorCode } from '@/types/transferError';
+
+import {
+  assertWorkspaceRowManageable,
+  isWorkspaceNonOwner,
+} from './_helpers/assertWorkspaceRowManageable';
 
 /**
  * Custom schema for agent member input, replacing drizzle-generated insertAgentSchema
@@ -35,7 +40,7 @@ const agentMemberInputSchema = z
     model: z.string().nullish(),
     params: z.any().nullish(),
     pinned: z.boolean().nullish(),
-    plugins: z.array(z.string()).nullish(),
+    plugins: z.array(AgentPluginEntrySchema).nullish(),
     provider: z.string().nullish(),
     sessionGroupId: z.string().nullish(),
     slug: z.string().nullish(),
@@ -93,7 +98,10 @@ export const agentGroupRouter = router({
       // Batch create virtual agents
       const agentConfigs = input.agents.map((agent) => ({
         ...agent,
-        plugins: agent.plugins as string[] | undefined,
+        // `agentModel.batchCreate`'s config type is still `plugins?: string[]`
+        // (widening deferred to the tri-state rollout's final phase); the
+        // zod schema above already allows the tri-state object shape through.
+        plugins: agent.plugins as unknown as string[] | undefined,
         tags: agent.tags as string[] | undefined,
         virtual: true,
       }));
@@ -160,7 +168,7 @@ export const agentGroupRouter = router({
             description: z.string().nullish(),
             model: z.string().nullish(),
             params: z.any().nullish(),
-            plugins: z.array(z.string()).nullish(),
+            plugins: z.array(AgentPluginEntrySchema).nullish(),
             provider: z.string().nullish(),
             systemRole: z.string().nullish(),
             tags: z.array(z.string()).nullish(),
@@ -173,7 +181,9 @@ export const agentGroupRouter = router({
       // 1. Batch create virtual member agents
       const memberConfigs = input.members.map((member) => ({
         ...member,
-        plugins: member.plugins as string[] | undefined,
+        // See the `batchCreateAgentsInGroup` cast above for why this bridges
+        // to `string[]` instead of failing type-check.
+        plugins: member.plugins as unknown as string[] | undefined,
         tags: member.tags as string[] | undefined,
         virtual: true,
       }));
@@ -206,6 +216,19 @@ export const agentGroupRouter = router({
   deleteGroup: agentGroupProcedureWrite
     .input(z.object({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
+      const group = await ctx.chatGroupModel.findById(input.id);
+      if (!group) throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent group not found' });
+      assertWorkspaceRowManageable(ctx, group.userId, 'group');
+      // Same rule as transfer: deleting the group cascades topics/threads/
+      // messages via FK, so a non-owner member must not erase teammates'
+      // conversations along with their own group.
+      if (isWorkspaceNonOwner(ctx) && (await ctx.agentGroupRepo.transferHasForeignRows(input.id))) {
+        throw new TRPCError({
+          code: 'FORBIDDEN',
+          message: "Only workspace owners can delete a group carrying others' conversations",
+        });
+      }
+
       return ctx.agentGroupService.deleteGroup(input.id);
     }),
 
@@ -297,6 +320,11 @@ export const agentGroupRouter = router({
       }),
     )
     .mutation(async ({ input, ctx }) => {
+      // Strips members and hard-deletes virtual agents — creator/owner only.
+      const group = await ctx.chatGroupModel.findById(input.groupId);
+      if (!group) throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent group not found' });
+      assertWorkspaceRowManageable(ctx, group.userId, 'group');
+
       return ctx.agentGroupRepo.removeAgentsFromGroup(
         input.groupId,
         input.agentIds,
@@ -362,6 +390,19 @@ export const agentGroupRouter = router({
           cause: { data: { code: TransferErrorCode.SameWorkspace } },
           code: 'BAD_REQUEST',
           message: 'Cannot transfer agent group to the same workspace',
+        });
+      }
+
+      // The transfer rehomes member agents and every group conversation — a
+      // non-owner member must not move teammates' rows along with their group.
+      if (
+        isWorkspaceNonOwner(ctx) &&
+        (await ctx.agentGroupRepo.transferHasForeignRows(input.groupId))
+      ) {
+        throw new TRPCError({
+          cause: { data: { code: TransferErrorCode.OwnerOnly } },
+          code: 'FORBIDDEN',
+          message: "Only workspace owners can transfer a group carrying others' content",
         });
       }
 
